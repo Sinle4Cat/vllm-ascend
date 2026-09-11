@@ -24,6 +24,7 @@ from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
+from vllm_ascend.ops import gdn as gdn_module
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.ops.gdn_attn_builder import (
     GDNCausalConv1dMetadata,
@@ -125,6 +126,37 @@ def _make_prefill_metadata(device: torch.device | str = "cpu") -> GDNAttentionMe
         chunk=Mock(),
     )
     return metadata
+
+
+def test_xllm_backend_is_routed_only_to_pure_prefill():
+    metadata = _make_prefill_metadata()
+    layer_metadata = {"layers.0.linear_attn": metadata}
+
+    with (
+        patch.object(gdn_module, "_GDN_BACKEND", "xllm_ops"),
+        patch("vllm_ascend.ops.gdn.get_pcp_group", return_value=SimpleNamespace(world_size=1)),
+    ):
+        assert gdn_module._use_xllm_prefill(layer_metadata, "layers.0.linear_attn", False)
+
+        metadata.num_prefills = 0
+        metadata.num_decodes = 1
+        assert not gdn_module._use_xllm_prefill(layer_metadata, "layers.0.linear_attn", False)
+
+        metadata.num_prefills = 1
+        assert not gdn_module._use_xllm_prefill(layer_metadata, "layers.0.linear_attn", False)
+
+        metadata.num_decodes = 0
+        metadata.spec_sequence_masks = torch.ones(1, dtype=torch.bool)
+        assert not gdn_module._use_xllm_prefill(layer_metadata, "layers.0.linear_attn", False)
+
+        metadata.spec_sequence_masks = None
+        assert not gdn_module._use_xllm_prefill(layer_metadata, "layers.0.linear_attn", True)
+
+    with (
+        patch.object(gdn_module, "_GDN_BACKEND", "xllm_ops"),
+        patch("vllm_ascend.ops.gdn.get_pcp_group", return_value=SimpleNamespace(world_size=2)),
+    ):
+        assert not gdn_module._use_xllm_prefill(layer_metadata, "layers.0.linear_attn", False)
 
 
 def test_connector_observes_updated_gdn_state_for_each_compiled_call():

@@ -15,15 +15,19 @@
 # limitations under the License.
 #
 
+import os
+
 import torch
 import torch_npu
 from einops import rearrange
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 from vllm.triton_utils import triton
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # type: ignore
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -40,11 +44,57 @@ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_s
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
+_GDN_BACKEND = os.getenv("VLLM_ASCEND_GDN_BACKEND", "baseline").strip().lower()
+_SUPPORTED_GDN_BACKENDS = {"baseline", "xllm_ops", "ascendc_phase6"}
+if _GDN_BACKEND not in _SUPPORTED_GDN_BACKENDS:
+    raise ValueError(
+        f"Unsupported VLLM_ASCEND_GDN_BACKEND={_GDN_BACKEND!r}; expected one of {sorted(_SUPPORTED_GDN_BACKENDS)}"
+    )
+
+_xllm_ops = None
+_ascendc_gdn_core_fwd_phase6 = None
+if _GDN_BACKEND == "xllm_ops":
+    import custom_ops_lib as _xllm_ops
+elif _GDN_BACKEND == "ascendc_phase6":
+    from fla_npu.ops.ascendc import gdn_core_fwd_phase6 as _ascendc_gdn_core_fwd_phase6
+
+if _GDN_BACKEND != "baseline":
+    logger.info("Configured VLLM Ascend GDN backend: %s", _GDN_BACKEND)
+
+
+def _use_xllm_prefill(
+    attn_metadata: AttentionMetadata | dict[str, AttentionMetadata] | None,
+    prefix: str,
+    has_conv_bias: bool,
+) -> bool:
+    """Return whether this invocation can use the xLLM MegaGDN prefill op."""
+    if _GDN_BACKEND != "xllm_ops" or has_conv_bias:
+        return False
+    if not isinstance(attn_metadata, dict):
+        return False
+    layer_metadata = attn_metadata.get(prefix)
+    return (
+        isinstance(layer_metadata, GDNAttentionMetadata)
+        and layer_metadata.spec_sequence_masks is None
+        and layer_metadata.num_prefills > 0
+        and layer_metadata.num_decodes == 0
+        and get_pcp_group().world_size == 1
+    )
+
+
+def _canonical_chunk_indices(cu_seqlens: tuple[int, ...], chunk_size: int) -> tuple[int, ...]:
+    indices: list[int] = []
+    for seq_idx, (start, end) in enumerate(zip(cu_seqlens, cu_seqlens[1:])):
+        for chunk_idx in range((end - start + chunk_size - 1) // chunk_size):
+            indices.extend((seq_idx, chunk_idx))
+    return tuple(indices)
+
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     # Cached fused-op availability probe result, shared across all layers so the
     # smoke call runs at most once per process.
     _fused_chunk_available: bool | None = None
+    _xllm_mask_cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, ...]] = {}
 
     @classmethod
     def _probe_fused_chunk(cls) -> bool:
@@ -151,6 +201,96 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         return o.unsqueeze(0), final_state
 
+    @classmethod
+    def _get_xllm_masks(
+        cls,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (device, dtype)
+        cached = cls._xllm_mask_cache.get(key)
+        if cached is None:
+            mask_lower = torch.tril(
+                torch.ones((128, 128), dtype=torch.float32, device=device),
+                diagonal=-1,
+            )
+            mask_full = torch.tril(torch.ones((128, 128), dtype=torch.float32, device=device))
+            minus_identity = torch.zeros((128, 128), dtype=dtype, device=device)
+            minus_identity.fill_diagonal_(-1)
+            cached = (mask_lower, mask_full, minus_identity)
+            cls._xllm_mask_cache[key] = cached
+        return cached
+
+    def _xllm_prefill(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        z: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        conv_weights: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> torch.Tensor:
+        assert _xllm_ops is not None
+        prefill_state_indices = attn_metadata.prefill_state_indices
+        prefill_has_initial_state = attn_metadata.prefill_has_initial_state
+        prefill_query_start_loc = attn_metadata.prefill_query_start_loc
+        prefill_metadata = attn_metadata.non_spec_prefill_metadata
+        assert prefill_state_indices is not None
+        assert prefill_has_initial_state is not None
+        assert prefill_query_start_loc is not None
+        assert prefill_metadata is not None
+
+        # MegaGdnPrefill stores the FLA [K,V] state layout, while vLLM keeps
+        # [V,K].  Compact per-request scratch caches avoid transposing the full
+        # cache and preserve vLLM's layout for mixed/fallback execution.
+        state_indices = prefill_state_indices.to(torch.long)
+        conv_scratch = conv_state.index_select(0, state_indices).contiguous()
+        ssm_scratch = ssm_state.index_select(0, state_indices).transpose(-1, -2).contiguous()
+        scratch_write_indices = torch.arange(
+            state_indices.numel(),
+            dtype=torch.int32,
+            device=state_indices.device,
+        )
+        scratch_read_indices = torch.where(
+            prefill_has_initial_state.to(torch.bool),
+            scratch_write_indices,
+            torch.full_like(scratch_write_indices, -1),
+        ).contiguous()
+        mask_lower, mask_full, minus_identity = self._get_xllm_masks(mixed_qkv.device, mixed_qkv.dtype)
+        cu_seqlens = prefill_query_start_loc.to(torch.int32).contiguous()
+        cu_seqlens_host = prefill_metadata.chunk.cu_seqlens_host
+        local_v_heads = self.num_v_heads // self.tp_size
+        num_matrices = (
+            sum((end - start + 127) // 128 for start, end in zip(cu_seqlens_host, cu_seqlens_host[1:])) * local_v_heads
+        )
+
+        norm_out = _xllm_ops.mega_gdn_prefill_op(
+            mixed_qkv.contiguous(),
+            b.contiguous(),
+            a.contiguous(),
+            z.contiguous(),
+            conv_weights.transpose(0, 1).contiguous(),
+            conv_scratch,
+            self.A_log.contiguous(),
+            self.dt_bias.to(torch.float32).contiguous(),
+            scratch_read_indices,
+            scratch_write_indices,
+            scratch_read_indices,
+            scratch_write_indices,
+            ssm_scratch,
+            mask_lower,
+            mask_full,
+            minus_identity,
+            cu_seqlens,
+            self.norm.weight.contiguous(),
+            num_matrices,
+        )
+        conv_state.index_copy_(0, state_indices, conv_scratch)
+        ssm_state.index_copy_(0, state_indices, ssm_scratch.transpose(-1, -2).contiguous())
+        return norm_out
+
     def _split_ba_for_tp(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "split_ba"):
             return self.split_ba(ba)
@@ -236,24 +376,39 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
-        torch.ops.vllm.qwen_gdn_attention_core(
-            mixed_qkv,
-            b,
-            a,
-            core_attn_out,
-            self.prefix,
-            False,
-        )
+        if _GDN_BACKEND == "xllm_ops":
+            # Keep mixed_qkv identical to baseline in every phase. The opaque
+            # custom op receives z separately so runtime metadata can select
+            # MegaGDN for pure prefill without freezing a Python graph branch.
+            torch.ops.vllm.ascend_qwen_gdn_attention_core(
+                mixed_qkv,
+                b,
+                a,
+                z,
+                core_attn_out,
+                self.prefix,
+            )
+        else:
+            torch.ops.vllm.qwen_gdn_attention_core(
+                mixed_qkv,
+                b,
+                a,
+                core_attn_out,
+                self.prefix,
+                False,
+            )
 
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
         z_shape_og = z.shape
-        # Reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
+        if _GDN_BACKEND != "xllm_ops":
+            # MegaGdn already includes gated RMSNorm. Other backends retain
+            # the model's original post-core normalization.
+            core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+            z = z.reshape(-1, z.shape[-1])
+            core_attn_out = self.norm(core_attn_out, z)
+            core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         out, _ = self.out_proj(core_attn_out)
         if output is not None:
@@ -266,6 +421,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         b: torch.Tensor,
         a: torch.Tensor,
         core_attn_out: torch.Tensor,
+        xllm_z: torch.Tensor | None = None,
     ):
         """
         Core attention computation (called by custom op).
@@ -285,6 +441,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         wait_for_kv_layer_from_connector(self.prefix)
         record_attention_compute_start()
 
+        use_xllm_prefill = _use_xllm_prefill(
+            attn_metadata,
+            self.prefix,
+            self.conv1d.bias is not None,
+        )
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -300,9 +461,26 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
+        if xllm_z is not None:
+            xllm_z = xllm_z[:num_actual_tokens]
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+        if use_xllm_prefill:
+            assert xllm_z is not None
+            norm_out = self._xllm_prefill(
+                mixed_qkv,
+                b,
+                a,
+                xllm_z,
+                attn_metadata,
+                conv_weights,
+                self_kv_cache[0],
+                ssm_state,
+            )
+            core_attn_out[:num_actual_tokens] = norm_out
+            maybe_save_kv_layer_to_connector("", [])
+            return
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 mixed_qkv_spec = mixed_qkv
@@ -521,11 +699,51 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 g_non_spec = g_non_spec[:, num_decode_tokens:]
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
 
+            use_ascendc_phase6 = (
+                _GDN_BACKEND == "ascendc_phase6"
+                and _ascendc_gdn_core_fwd_phase6 is not None
+                and get_pcp_group().world_size == 1
+            )
             # Use the fused CANN operator when available (probed once, cached on
             # the class) and applicable. It only supports the non-PCP case; fall
             # back to the Triton pipeline under PCP or if the op is unavailable.
-            use_fused_chunk = AscendGatedDeltaNetAttention._probe_fused_chunk() and get_pcp_group().world_size == 1
-            if use_fused_chunk:
+            use_fused_chunk = (
+                not use_ascendc_phase6
+                and AscendGatedDeltaNetAttention._probe_fused_chunk()
+                and get_pcp_group().world_size == 1
+            )
+            if use_ascendc_phase6:
+                prebuilt_meta = attn_metadata.non_spec_prefill_metadata.chunk
+                initial_state_full = ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
+                clear_ssm_states(initial_state_full, prefill_has_initial_state)
+                keep_meta = prebuilt_meta.keep_meta
+                initial_state = initial_state_full if keep_meta is None else initial_state_full[keep_meta]
+                cu_seqlens_host = prebuilt_meta.cu_seqlens_kern or prebuilt_meta.cu_seqlens_host
+                chunk_indices_host = _canonical_chunk_indices(cu_seqlens_host, 64)
+                query_phase6 = l2norm_fwd(query_non_spec).transpose(1, 2).contiguous()
+                key_phase6 = l2norm_fwd(key_non_spec).transpose(1, 2).contiguous()
+                value_phase6 = value_non_spec.transpose(1, 2).contiguous()
+                core_phase6, last_recurrent_state, _, _ = _ascendc_gdn_core_fwd_phase6(
+                    query_phase6,
+                    key_phase6,
+                    value_phase6,
+                    g_non_spec,
+                    beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    chunk_size=64,
+                    cu_seqlens=cu_seqlens_host,
+                    chunk_indices=chunk_indices_host,
+                    scale=key_non_spec.shape[-1] ** -0.5,
+                )
+                core_attn_out_non_spec = core_phase6.transpose(1, 2).contiguous()
+                if keep_meta is not None:
+                    initial_state_full[keep_meta] = last_recurrent_state
+                    last_recurrent_state = initial_state_full
+                ssm_state[prefill_state_indices] = (
+                    last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
+                )
+            elif use_fused_chunk:
                 # The fused op's state layout [N, Nv, Dv, Dk] matches ssm_state
                 # directly, so no transpose is needed. Advanced indexing already
                 # returns a copy, safe to clear in place.
@@ -602,4 +820,54 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
+        if _GDN_BACKEND == "xllm_ops":
+            # MegaGDN already returns normalized output. All fallback paths,
+            # including decode, retain the original post-core RMSNorm order.
+            assert xllm_z is not None
+            fallback_out = core_attn_out[:num_actual_tokens].reshape(-1, self.head_v_dim)
+            fallback_z = xllm_z[:num_actual_tokens].reshape(-1, self.head_v_dim)
+            core_attn_out[:num_actual_tokens] = self.norm(fallback_out, fallback_z).reshape(
+                num_actual_tokens,
+                self.num_v_heads // self.tp_size,
+                self.head_v_dim,
+            )
         maybe_save_kv_layer_to_connector("", [])
+
+
+def _ascend_qwen_gdn_attention_core(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    z: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    forward_context = get_forward_context()
+    layer = forward_context.no_compile_layers[layer_name]
+    layer._forward_core(
+        mixed_qkv=mixed_qkv,
+        b=b,
+        a=a,
+        core_attn_out=core_attn_out,
+        xllm_z=z,
+    )
+
+
+def _ascend_qwen_gdn_attention_core_fake(
+    mixed_qkv: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    z: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="ascend_qwen_gdn_attention_core",
+    op_func=_ascend_qwen_gdn_attention_core,
+    mutates_args=["core_attn_out"],
+    fake_impl=_ascend_qwen_gdn_attention_core_fake,
+)

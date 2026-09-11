@@ -1231,6 +1231,7 @@ def _setup_compile_backend(
         # class attribute may still hold the pre-modification value after spawn.
         compilation_config.splitting_ops.extend(
             [
+                "vllm::ascend_qwen_gdn_attention_core",
                 "vllm::mla_forward",
                 "vllm::dsa_forward",
             ]
