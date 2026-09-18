@@ -28,6 +28,11 @@ from typing import Any
 # begin-env-vars-definition
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # GDN implementation (non-sensitive). baseline is the default; xllm_ops
+    # fuses prefill only. Experimental xllm_ops_prefill_decode also fuses
+    # supported batch-one decode and MTP verification; accuracy is not accepted.
+    # ascendc_phase6 selects the Phase6 prefill core.
+    "VLLM_ASCEND_GDN_BACKEND": lambda: os.getenv("VLLM_ASCEND_GDN_BACKEND", "baseline").strip().lower(),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.

@@ -234,6 +234,8 @@ _GDN_PATCH_TARGET.get_attn_backend = AscendGatedDeltaNetAttention.get_attn_backe
 _GDN_PATCH_TARGET._xllm_mask_cache = AscendGatedDeltaNetAttention._xllm_mask_cache
 _GDN_PATCH_TARGET._get_xllm_masks = AscendGatedDeltaNetAttention.__dict__["_get_xllm_masks"]
 _GDN_PATCH_TARGET._xllm_prefill = AscendGatedDeltaNetAttention._xllm_prefill
+_GDN_PATCH_TARGET._xllm_decode = AscendGatedDeltaNetAttention._xllm_decode
+_GDN_PATCH_TARGET._xllm_mtp_decode = AscendGatedDeltaNetAttention._xllm_mtp_decode
 
 if get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY):
     from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310

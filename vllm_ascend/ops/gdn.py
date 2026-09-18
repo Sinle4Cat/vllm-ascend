@@ -15,8 +15,6 @@
 # limitations under the License.
 #
 
-import os
-
 import torch
 import torch_npu
 from einops import rearrange
@@ -32,6 +30,7 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata  # typ
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend import envs
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
     wait_for_kv_layer_from_connector,
@@ -42,10 +41,15 @@ from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
+from vllm_ascend.ops.triton.fla.xllm_mtp_state import copy_mtp_states_to_native
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
-_GDN_BACKEND = os.getenv("VLLM_ASCEND_GDN_BACKEND", "baseline").strip().lower()
-_SUPPORTED_GDN_BACKENDS = {"baseline", "xllm_ops", "ascendc_phase6"}
+_GDN_BACKEND = envs.VLLM_ASCEND_GDN_BACKEND
+_XLLM_GDN_BACKENDS = frozenset({"xllm_ops", "xllm_ops_prefill_decode"})
+_SUPPORTED_GDN_BACKENDS = {"baseline", "ascendc_phase6", *_XLLM_GDN_BACKENDS}
+_XLLM_DECODE_HEAD_DIM = 128
+_XLLM_DECODE_MAX_CACHE_SLOTS = 1024
+_XLLM_MTP_MAX_SPEC_TOKENS = 16
 if _GDN_BACKEND not in _SUPPORTED_GDN_BACKENDS:
     raise ValueError(
         f"Unsupported VLLM_ASCEND_GDN_BACKEND={_GDN_BACKEND!r}; expected one of {sorted(_SUPPORTED_GDN_BACKENDS)}"
@@ -53,7 +57,7 @@ if _GDN_BACKEND not in _SUPPORTED_GDN_BACKENDS:
 
 _xllm_ops = None
 _ascendc_gdn_core_fwd_phase6 = None
-if _GDN_BACKEND == "xllm_ops":
+if _GDN_BACKEND in _XLLM_GDN_BACKENDS:
     import custom_ops_lib as _xllm_ops
 elif _GDN_BACKEND == "ascendc_phase6":
     from fla_npu.ops.ascendc import gdn_core_fwd_phase6 as _ascendc_gdn_core_fwd_phase6
@@ -68,7 +72,7 @@ def _use_xllm_prefill(
     has_conv_bias: bool,
 ) -> bool:
     """Return whether this invocation can use the xLLM MegaGDN prefill op."""
-    if _GDN_BACKEND != "xllm_ops" or has_conv_bias:
+    if _GDN_BACKEND not in _XLLM_GDN_BACKENDS or has_conv_bias:
         return False
     if not isinstance(attn_metadata, dict):
         return False
@@ -82,12 +86,76 @@ def _use_xllm_prefill(
     )
 
 
+def _use_xllm_decode(
+    attn_metadata: AttentionMetadata | dict[str, AttentionMetadata] | None,
+    prefix: str,
+    has_conv_bias: bool,
+) -> bool:
+    """Select the initial batch-one decode experiment without graph padding."""
+    if _GDN_BACKEND != "xllm_ops_prefill_decode" or has_conv_bias:
+        return False
+    if not isinstance(attn_metadata, dict):
+        return False
+    layer_metadata = attn_metadata.get(prefix)
+    if not isinstance(layer_metadata, GDNAttentionMetadata):
+        return False
+    decode_metadata = getattr(layer_metadata, "non_spec_decode_metadata", None)
+    state_indices = layer_metadata.non_spec_state_indices_tensor
+    return (
+        layer_metadata.spec_sequence_masks is None
+        and layer_metadata.num_spec_decodes == 0
+        and layer_metadata.num_prefills == 0
+        and layer_metadata.num_decodes == 1
+        and layer_metadata.num_decode_tokens == 1
+        and layer_metadata.num_actual_tokens == 1
+        and state_indices is not None
+        and state_indices.numel() == 1
+        and decode_metadata is not None
+        and decode_metadata.causal_conv1d.query_start_loc.numel() == 2
+        and get_pcp_group().world_size == 1
+    )
+
+
 def _canonical_chunk_indices(cu_seqlens: tuple[int, ...], chunk_size: int) -> tuple[int, ...]:
     indices: list[int] = []
     for seq_idx, (start, end) in enumerate(zip(cu_seqlens, cu_seqlens[1:])):
         for chunk_idx in range((end - start + chunk_size - 1) // chunk_size):
             indices.extend((seq_idx, chunk_idx))
     return tuple(indices)
+
+
+def _use_xllm_mtp_decode(
+    attn_metadata: AttentionMetadata | dict[str, AttentionMetadata] | None,
+    prefix: str,
+    has_conv_bias: bool,
+) -> bool:
+    """Select uniform batch-one verification, never a mixed or padded batch."""
+    if _GDN_BACKEND != "xllm_ops_prefill_decode" or has_conv_bias:
+        return False
+    if not isinstance(attn_metadata, dict):
+        return False
+    metadata = attn_metadata.get(prefix)
+    if not isinstance(metadata, GDNAttentionMetadata):
+        return False
+    indices = metadata.spec_state_indices_tensor
+    decode_metadata = getattr(metadata, "spec_decode_metadata", None)
+    if indices is None or indices.ndim != 2 or decode_metadata is None:
+        return False
+    sequence_length = indices.shape[1]
+    causal = decode_metadata.spec_causal_conv1d
+    return (
+        metadata.spec_sequence_masks is not None
+        and metadata.num_prefills == 0
+        and metadata.num_decodes == 0
+        and metadata.num_spec_decodes == 1
+        and indices.shape[0] == 1
+        and 2 <= sequence_length <= _XLLM_MTP_MAX_SPEC_TOKENS + 1
+        and metadata.num_actual_tokens == sequence_length
+        and metadata.num_spec_decode_tokens == sequence_length
+        and causal.query_start_loc.numel() == 2
+        and causal.num_accepted_tokens.numel() == 1
+        and get_pcp_group().world_size == 1
+    )
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -258,6 +326,23 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             scratch_write_indices,
             torch.full_like(scratch_write_indices, -1),
         ).contiguous()
+        conv_history_length = conv_weights.shape[-1] - 1
+        checkpoint_stride = conv_scratch.shape[1] - conv_history_length + 1
+        assert checkpoint_stride >= 1, "MegaGDN prefill requires a full convolution history"
+        ssm_read_indices = scratch_read_indices
+        ssm_write_indices = scratch_write_indices
+        if checkpoint_stride > 1:
+            # Main requires R SSM checkpoints per conv slot. Native vLLM keeps
+            # one state, so reserve scratch checkpoints without changing its bank.
+            initial_ssm = ssm_scratch
+            ssm_scratch = initial_ssm.new_zeros((state_indices.numel() * checkpoint_stride, *initial_ssm.shape[1:]))
+            ssm_scratch[::checkpoint_stride].copy_(initial_ssm)
+            ssm_write_indices = scratch_write_indices * checkpoint_stride
+            ssm_read_indices = torch.where(
+                scratch_read_indices < 0,
+                scratch_read_indices,
+                scratch_read_indices * checkpoint_stride,
+            ).contiguous()
         mask_lower, mask_full, minus_identity = self._get_xllm_masks(mixed_qkv.device, mixed_qkv.dtype)
         cu_seqlens = prefill_query_start_loc.to(torch.int32).contiguous()
         cu_seqlens_host = prefill_metadata.chunk.cu_seqlens_host
@@ -277,8 +362,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.dt_bias.to(torch.float32).contiguous(),
             scratch_read_indices,
             scratch_write_indices,
-            scratch_read_indices,
-            scratch_write_indices,
+            ssm_read_indices,
+            ssm_write_indices,
             ssm_scratch,
             mask_lower,
             mask_full,
@@ -288,8 +373,131 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_matrices,
         )
         conv_state.index_copy_(0, state_indices, conv_scratch)
+        if checkpoint_stride > 1:
+            ssm_scratch = ssm_scratch[::checkpoint_stride]
         ssm_state.index_copy_(0, state_indices, ssm_scratch.transpose(-1, -2).contiguous())
         return norm_out
+
+    def _xllm_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        z: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        conv_weights: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> torch.Tensor:
+        assert _xllm_ops is not None
+        state_indices = attn_metadata.non_spec_state_indices_tensor[: mixed_qkv.shape[0]]
+        state_indices_i32 = state_indices.to(torch.int32).contiguous()
+        use_scratch = (
+            conv_state.shape[0] > _XLLM_DECODE_MAX_CACHE_SLOTS
+            or not conv_state.is_contiguous()
+            or not ssm_state.is_contiguous()
+        )
+        if use_scratch:
+            state_indices_long = state_indices.to(torch.long)
+            conv_work = conv_state.index_select(0, state_indices_long).contiguous()
+            ssm_work = ssm_state.index_select(0, state_indices_long).contiguous()
+            op_indices = torch.arange(mixed_qkv.shape[0], dtype=torch.int32, device=mixed_qkv.device)
+        else:
+            conv_work, ssm_work, op_indices = conv_state, ssm_state, state_indices_i32
+
+        packed_weights = getattr(self, "_xllm_decode_conv_weights", None)
+        if packed_weights is None:
+            packed_weights = conv_weights.transpose(0, 1).contiguous()
+            self._xllm_decode_conv_weights = packed_weights
+            logger.info(
+                "MegaGDN decode route: layer=%s batch=1 state_layout=VK cache_slots=%d compact_scratch=%s",
+                self.prefix,
+                conv_state.shape[0],
+                use_scratch,
+            )
+
+        # non-FLA mode consumes vLLM's native [V,K] FP32 state directly.
+        # The operator returns gated RMSNorm output and mutates both caches.
+        _, _, _, norm_out = _xllm_ops.mega_gdn_decode(
+            mixed_qkv.contiguous(),
+            z.contiguous(),
+            b.contiguous(),
+            a.contiguous(),
+            packed_weights,
+            conv_work,
+            self.A_log.to(torch.float32).contiguous(),
+            self.dt_bias.to(torch.float32).contiguous(),
+            ssm_work,
+            op_indices,
+            op_indices,
+            self.norm.weight.contiguous(),
+            False,
+        )
+        if use_scratch:
+            conv_state.index_copy_(0, state_indices_long, conv_work)
+            ssm_state.index_copy_(0, state_indices_long, ssm_work)
+        return norm_out
+
+    def _xllm_mtp_decode(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        z: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        conv_weights: torch.Tensor,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+    ) -> torch.Tensor:
+        assert _xllm_ops is not None
+        native_indices = attn_metadata.spec_state_indices_tensor.flatten().contiguous()
+        sequence_length = native_indices.numel()
+        causal = attn_metadata.spec_decode_metadata.spec_causal_conv1d
+        # vLLM checkpoint IDs need not be adjacent. A compact bank gives the
+        # fused op its required slot*S+t layout without changing the allocator.
+        safe_indices = native_indices.clamp(0, ssm_state.shape[0] - 1).to(torch.long)
+        conv_work = conv_state.index_select(0, safe_indices[:1]).contiguous()
+        ssm_work = ssm_state.index_select(0, safe_indices).contiguous()
+        op_indices = torch.zeros(1, dtype=torch.int32, device=mixed_qkv.device)
+        accepted = causal.num_accepted_tokens.clamp(1, sequence_length).to(torch.int32).contiguous()
+        packed_weights = getattr(self, "_xllm_mtp_conv_weights", None)
+        if packed_weights is None:
+            packed_weights = conv_weights.transpose(0, 1).contiguous()
+            self._xllm_mtp_conv_weights = packed_weights
+            logger.info(
+                "MegaGDN MTP decode route: layer=%s batch=1 speculative_tokens=%d "
+                "state_layout=VK native_cache_slots=%d",
+                self.prefix,
+                sequence_length - 1,
+                ssm_state.shape[0],
+            )
+        _, _, _, norm_out = _xllm_ops.mega_gdn_mtp_decode(
+            mixed_qkv.reshape(1, sequence_length, -1).contiguous(),
+            z.reshape(1, sequence_length, *z.shape[1:]).contiguous(),
+            b.reshape(1, sequence_length, -1).contiguous(),
+            a.reshape(1, sequence_length, -1).contiguous(),
+            packed_weights,
+            conv_work,
+            self.A_log.to(torch.float32).contiguous(),
+            self.dt_bias.to(torch.float32).contiguous(),
+            ssm_work,
+            op_indices,
+            op_indices,
+            accepted,
+            self.norm.weight.contiguous(),
+            False,
+        )
+        copy_mtp_states_to_native(
+            conv_state,
+            ssm_state,
+            conv_work,
+            ssm_work,
+            norm_out,
+            native_indices,
+            causal.query_start_loc,
+            causal.num_accepted_tokens,
+        )
+        return norm_out.reshape(sequence_length, *z.shape[1:])
 
     def _split_ba_for_tp(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "split_ba"):
@@ -376,7 +584,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
-        if _GDN_BACKEND == "xllm_ops":
+        if _GDN_BACKEND in _XLLM_GDN_BACKENDS:
             # Keep mixed_qkv identical to baseline in every phase. The opaque
             # custom op receives z separately so runtime metadata can select
             # MegaGDN for pure prefill without freezing a Python graph branch.
@@ -402,7 +610,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 3: Output Projection
         # ============================================================
         z_shape_og = z.shape
-        if _GDN_BACKEND != "xllm_ops":
+        if _GDN_BACKEND not in _XLLM_GDN_BACKENDS:
             # MegaGdn already includes gated RMSNorm. Other backends retain
             # the model's original post-core normalization.
             core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
@@ -446,6 +654,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.prefix,
             self.conv1d.bias is not None,
         )
+        use_xllm_decode = _use_xllm_decode(attn_metadata, self.prefix, self.conv1d.bias is not None)
+        use_xllm_mtp_decode = _use_xllm_mtp_decode(attn_metadata, self.prefix, self.conv1d.bias is not None)
         assert isinstance(attn_metadata, dict)
         attn_metadata = attn_metadata[self.prefix]
         assert isinstance(attn_metadata, GDNAttentionMetadata)
@@ -477,6 +687,69 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_weights,
                 self_kv_cache[0],
                 ssm_state,
+            )
+            core_attn_out[:num_actual_tokens] = norm_out
+            maybe_save_kv_layer_to_connector("", [])
+            return
+        local_v_heads = self.num_v_heads // self.tp_size
+        local_k_heads = (mixed_qkv.shape[-1] // _XLLM_DECODE_HEAD_DIM - local_v_heads) // 2
+        if (
+            use_xllm_decode
+            and self.head_v_dim == _XLLM_DECODE_HEAD_DIM
+            and mixed_qkv.dtype == torch.bfloat16
+            and self_kv_cache[0].dtype == torch.bfloat16
+            and ssm_state.dtype == torch.float32
+            and self.norm.weight.dtype == torch.bfloat16
+            and conv_weights.dtype == torch.bfloat16
+            and conv_weights.shape[1] == 4
+            and self_kv_cache[0].shape[1] == 3
+            and self_kv_cache[0].shape[0] == ssm_state.shape[0]
+            and self.norm.eps == 1e-6
+            and self.norm.norm_before_gate
+            and self.norm.group_size in (None, self.head_v_dim)
+            and self.norm.activation in ("silu", "swish")
+            and self.activation in ("silu", "swish")
+            and 1 <= local_k_heads <= 16
+            and local_k_heads & (local_k_heads - 1) == 0
+            and local_v_heads % local_k_heads == 0
+            and 1 <= local_v_heads // local_k_heads <= 4
+        ):
+            assert xllm_z is not None
+            norm_out = self._xllm_decode(
+                mixed_qkv, b, a, xllm_z, attn_metadata, conv_weights, self_kv_cache[0], ssm_state
+            )
+            core_attn_out[:num_actual_tokens] = norm_out
+            maybe_save_kv_layer_to_connector("", [])
+            return
+        if (
+            use_xllm_mtp_decode
+            and self.head_v_dim == _XLLM_DECODE_HEAD_DIM
+            and mixed_qkv.dtype == torch.bfloat16
+            and self_kv_cache[0].dtype == torch.bfloat16
+            and ssm_state.dtype == torch.float32
+            and self.norm.weight.dtype == torch.bfloat16
+            and conv_weights.dtype == torch.bfloat16
+            and conv_weights.shape[1] == 4
+            and self_kv_cache[0].shape[1] == attn_metadata.spec_state_indices_tensor.shape[1] + 2
+            and self_kv_cache[0].shape[0] == ssm_state.shape[0]
+            and self_kv_cache[0].stride(1) == self_kv_cache[0].shape[2]
+            and self_kv_cache[0].stride(2) == 1
+            and ssm_state.stride(1) == self.head_v_dim * self.head_v_dim
+            and ssm_state.stride(2) == self.head_v_dim
+            and ssm_state.stride(3) == 1
+            and self.norm.eps == 1e-6
+            and self.norm.norm_before_gate
+            and self.norm.group_size in (None, self.head_v_dim)
+            and self.norm.activation in ("silu", "swish")
+            and self.activation in ("silu", "swish")
+            and 1 <= local_k_heads <= 16
+            and local_k_heads & (local_k_heads - 1) == 0
+            and local_v_heads % local_k_heads == 0
+            and 1 <= local_v_heads // local_k_heads <= 4
+        ):
+            assert xllm_z is not None
+            norm_out = self._xllm_mtp_decode(
+                mixed_qkv, b, a, xllm_z, attn_metadata, conv_weights, self_kv_cache[0], ssm_state
             )
             core_attn_out[:num_actual_tokens] = norm_out
             maybe_save_kv_layer_to_connector("", [])
@@ -821,7 +1094,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
-        if _GDN_BACKEND == "xllm_ops":
+        if _GDN_BACKEND in _XLLM_GDN_BACKENDS:
             # MegaGDN already returns normalized output. All fallback paths,
             # including decode, retain the original post-core RMSNorm order.
             assert xllm_z is not None

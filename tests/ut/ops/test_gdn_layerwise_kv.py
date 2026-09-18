@@ -16,6 +16,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 from torch import nn
 from vllm.forward_context import ForwardContext, override_forward_context
@@ -159,6 +160,79 @@ def test_xllm_backend_is_routed_only_to_pure_prefill():
         assert not gdn_module._use_xllm_prefill(layer_metadata, "layers.0.linear_attn", False)
 
 
+@pytest.mark.parametrize("checkpoint_stride", [1, 2, 5])
+@pytest.mark.parametrize("initial_state_flags", [(True, False), (False, True)])
+def test_xllm_prefill_checkpoint_scratch_preserves_native_cache(checkpoint_stride, initial_state_flags):
+    state_indices = torch.tensor([4, 1], dtype=torch.long)
+    has_initial_state = torch.tensor(initial_state_flags)
+    conv_state = torch.arange(5 * (checkpoint_stride + 2) * 6, dtype=torch.float32).reshape(5, checkpoint_stride + 2, 6)
+    ssm_state = torch.arange(5 * 2 * 2 * 2, dtype=torch.float32).reshape(5, 2, 2, 2)
+    conv_before, ssm_before = conv_state.clone(), ssm_state.clone()
+    final_ssm_kv = torch.arange(2 * 2 * 2 * 2, dtype=torch.float32).reshape(2, 2, 2, 2) + 100
+    expected_output = torch.arange(4 * 2 * 2, dtype=torch.float32).reshape(4, 2, 2)
+    metadata = _make_prefill_metadata()
+    metadata.num_prefills = 2
+    metadata.num_prefill_tokens = 4
+    metadata.num_actual_tokens = 4
+    metadata.prefill_state_indices = state_indices
+    metadata.prefill_has_initial_state = has_initial_state
+    metadata.prefill_query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+    metadata.non_spec_prefill_metadata.chunk.cu_seqlens_host = (0, 2, 4)
+    model = SimpleNamespace(
+        num_v_heads=2,
+        tp_size=1,
+        A_log=torch.zeros(2),
+        dt_bias=torch.zeros(2),
+        norm=SimpleNamespace(weight=torch.ones(2)),
+        _get_xllm_masks=AscendGatedDeltaNetAttention._get_xllm_masks,
+    )
+
+    def fused_prefill(*args):
+        conv_scratch, ssm_scratch = args[5], args[12]
+        conv_read, conv_write, ssm_read, ssm_write = args[8:12]
+        assert conv_scratch.shape == (2, checkpoint_stride + 2, 6)
+        assert ssm_scratch.shape == (2 * checkpoint_stride, 2, 2, 2)
+        assert conv_scratch.is_contiguous() and ssm_scratch.is_contiguous()
+        expected_read = [index if initialized else -1 for index, initialized in enumerate(initial_state_flags)]
+        assert conv_read.tolist() == expected_read
+        assert conv_write.tolist() == [0, 1]
+        assert ssm_read.tolist() == [index * checkpoint_stride if index >= 0 else -1 for index in expected_read]
+        assert ssm_write.tolist() == [0, checkpoint_stride]
+        torch.testing.assert_close(
+            ssm_scratch[::checkpoint_stride],
+            ssm_before.index_select(0, state_indices).transpose(-1, -2),
+        )
+        # Reserved checkpoint sentinels must never be copied into native state.
+        ssm_scratch.fill_(777)
+        ssm_scratch.index_copy_(0, ssm_write.long(), final_ssm_kv)
+        conv_scratch[:, :3].add_(10)
+        return expected_output
+
+    fused_op = Mock(side_effect=fused_prefill)
+    with patch.object(gdn_module, "_xllm_ops", SimpleNamespace(mega_gdn_prefill_op=fused_op)):
+        output = AscendGatedDeltaNetAttention._xllm_prefill(
+            model,
+            torch.zeros(4, 6),
+            torch.zeros(4, 2),
+            torch.zeros(4, 2),
+            torch.zeros(4, 2, 2),
+            metadata,
+            torch.ones(6, 4),
+            conv_state,
+            ssm_state,
+        )
+    fused_op.assert_called_once()
+    assert output is expected_output
+    expected_ssm = ssm_before.clone()
+    expected_ssm.index_copy_(0, state_indices, final_ssm_kv.transpose(-1, -2).contiguous())
+    torch.testing.assert_close(ssm_state, expected_ssm)
+    expected_conv = conv_before.clone()
+    selected_conv = conv_before.index_select(0, state_indices)
+    selected_conv[:, :3].add_(10)
+    expected_conv.index_copy_(0, state_indices, selected_conv)
+    torch.testing.assert_close(conv_state, expected_conv)
+
+
 def test_connector_observes_updated_gdn_state_for_each_compiled_call():
     # vLLM registers this production dispatcher for NPU only. Keep a CPU
     # registration alive for this test so Inductor sees the same custom op.
@@ -206,6 +280,7 @@ def test_connector_observes_updated_gdn_state_for_each_compiled_call():
         patch("vllm_ascend.ops.gdn.DeviceOperator.fused_gdn_gating", return_value=gating),
         patch("vllm_ascend.ops.gdn.clear_ssm_states"),
         patch("vllm_ascend.ops.gdn.chunk_gated_delta_rule", side_effect=chunk_attention),
+        patch.object(AscendGatedDeltaNetAttention, "_probe_fused_chunk", return_value=False),
         patch.object(
             torch.ops._C_ascend,
             "npu_causal_conv1d_custom",
