@@ -33,6 +33,7 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.ops.triton.fla.utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -701,6 +702,29 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 spec_sequence_indices,
             )
 
+        # A token-sized speculative graph can also replay ordinary one-token
+        # decodes. Keep one stable KV metadata contract for both phases.
+        if (
+            envs.VLLM_ASCEND_GDN_BACKEND == "xllm_ops_kv"
+            and self.use_full_cuda_graph
+            and self.use_spec_decode
+            and num_prefills == 0
+            and num_spec_decodes == 0
+            and num_decodes > 0
+        ):
+            spec_state_indices_tensor = block_table_tensor[:, : self.num_spec + 1]
+            spec_query_start_loc = non_spec_query_start_loc
+            spec_token_indx = torch.arange(num_decode_tokens, dtype=torch.int32, device=query_start_loc.device)
+            non_spec_token_indx = torch.empty(0, dtype=torch.int32, device=query_start_loc.device)
+            spec_sequence_masks = torch.ones(num_decodes, dtype=torch.bool, device=query_start_loc.device)
+            num_accepted_tokens = torch.ones(num_decodes, dtype=torch.int32, device=query_start_loc.device)
+            num_spec_decodes, num_spec_decode_tokens = num_decodes, num_decode_tokens
+            num_decodes, num_decode_tokens = 0, 0
+            non_spec_state_indices_tensor = None
+            non_spec_conv1d_cache_indices = None
+            non_spec_query_start_loc = None
+            non_spec_query_start_loc_cpu = None
+
         # A FULL graph retains captured speculative conv/recurrent tasks. Clear
         # their stable inputs on every no-spec replay so an idle or prefill
         # batch cannot mutate state belonging to the preceding request.
@@ -778,6 +802,19 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # it to the token count makes the conv1d update kernel treat every
             # token as an independent decode sequence.
             spec_batch_size = m.num_reqs
+            if envs.VLLM_ASCEND_GDN_BACKEND == "xllm_ops_kv":
+                # The padded token bucket bounds the largest possible request
+                # count (all S1), even when capture uses B1*S4. Actual live
+                # requests or tokens/S would freeze an unsafe smaller capacity.
+                graph_tokens = getattr(m, "num_input_tokens", None)
+                if not graph_tokens:
+                    sizes = getattr(self.compilation_config, "cudagraph_capture_sizes", None)
+                    graph_tokens = next(
+                        (size for size in sorted(sizes or []) if size >= m.num_actual_tokens),
+                        self.decode_cudagraph_max_bs,
+                    )
+                spec_batch_size = min(graph_tokens, self.decode_cudagraph_max_bs)
+                assert spec_batch_size >= num_spec_decodes
 
             self.spec_state_indices_tensor[spec_batch_size:].fill_(NULL_BLOCK_ID)
             self.spec_state_indices_tensor[:num_spec_decodes].copy_(

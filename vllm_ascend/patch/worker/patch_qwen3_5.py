@@ -32,7 +32,11 @@ except ImportError:
 from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
-from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+from vllm_ascend.ops.gdn import (
+    _GDN_BACKEND,
+    AscendGatedDeltaNetAttention,
+    _gdn_state_shape,
+)
 from vllm_ascend.utils import vllm_version_is
 
 if vllm_version_is("0.27.1"):
@@ -55,6 +59,16 @@ if vllm_version_is("0.27.1"):
     qwen3_next_module._all_gather_hidden_and_residual = _ascend_all_gather_hidden_and_residual
 
 _GDN_PATCH_TARGET = _GDNBaseCls
+
+if _GDN_BACKEND == "xllm_ops_kv":
+    from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+
+    if get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY):
+        raise ValueError("xllm_ops_kv does not support the Ascend 310P GDN compatibility path")
+
+    # Model-level allocation and layer-level shape queries must agree, including
+    # non-square state matrices. The calculator is specific to GDN caches.
+    MambaStateShapeCalculator.gated_delta_net_state_shape = classmethod(_gdn_state_shape)
 
 
 def _uses_multimodal_rope(attention: Qwen3NextAttention) -> bool:
@@ -234,6 +248,8 @@ _GDN_PATCH_TARGET.get_attn_backend = AscendGatedDeltaNetAttention.get_attn_backe
 _GDN_PATCH_TARGET._xllm_mask_cache = AscendGatedDeltaNetAttention._xllm_mask_cache
 _GDN_PATCH_TARGET._get_xllm_masks = AscendGatedDeltaNetAttention.__dict__["_get_xllm_masks"]
 _GDN_PATCH_TARGET._xllm_prefill = AscendGatedDeltaNetAttention._xllm_prefill
+_GDN_PATCH_TARGET._xllm_decode = AscendGatedDeltaNetAttention._xllm_decode
+_GDN_PATCH_TARGET._xllm_mtp_decode = AscendGatedDeltaNetAttention._xllm_mtp_decode
 
 if get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY):
     from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310

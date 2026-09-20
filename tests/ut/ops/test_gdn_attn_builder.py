@@ -915,6 +915,42 @@ def test_full_graph_without_runtime_spec_resets_captured_spec_inputs():
     assert torch.count_nonzero(captured_spec_metadata.actual_seq_lengths) == 0
 
 
+@pytest.mark.parametrize("bucket", [4, 8, 16, 32])
+def test_kv_spec_graph_keeps_request_capacity_across_b1s4_and_b4s1(bucket):
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+    )
+    capture = create_common_attn_metadata(BatchSpec([4], [4]), 16, torch.device("cpu"))
+    capture.num_input_tokens = bucket
+    capture.block_table_tensor = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+    replay = create_common_attn_metadata(BatchSpec([17] * 4, [1] * 4), 16, torch.device("cpu"))
+    replay.num_input_tokens = bucket
+    replay.block_table_tensor = torch.tensor([[20 + b * 4 + t for t in range(4)] for b in range(4)], dtype=torch.int32)
+    with patch.object(ascend_gdn_attn_builder.envs, "VLLM_ASCEND_GDN_BACKEND", "xllm_ops_kv"):
+        left = builder.build(
+            0,
+            capture,
+            num_accepted_tokens=torch.ones(1, dtype=torch.int32),
+            num_decode_draft_tokens_cpu=torch.tensor([3], dtype=torch.int32),
+        )
+        left_starts = left.spec_decode_metadata.spec_causal_conv1d.query_start_loc
+        left_indices = left.spec_state_indices_tensor
+        assert left_indices.shape == (bucket, 4)
+        right = builder.build(0, replay)
+    assert right.num_actual_tokens == 4 and right.num_spec_decode_tokens == 4
+    assert right.num_spec_decodes == 4 and right.num_decodes == 0
+    assert right.spec_state_indices_tensor.shape == left_indices.shape
+    assert right.spec_state_indices_tensor.data_ptr() == left_indices.data_ptr()
+    assert right.spec_decode_metadata.spec_causal_conv1d.query_start_loc.data_ptr() == left_starts.data_ptr()
+    assert right.spec_query_start_loc[:5].tolist() == [0, 1, 2, 3, 4]
+    assert torch.all(right.spec_query_start_loc[5:] == 4)
+    assert torch.all(right.spec_state_indices_tensor[4:] == NULL_BLOCK_ID)
+    assert right.num_accepted_tokens.tolist() == [1] * bucket
+
+
 def test_full_graph_idle_dummy_uses_zero_length_recurrent_metadata():
     common_attn_metadata = create_common_attn_metadata(
         batch_spec=BatchSpec(
