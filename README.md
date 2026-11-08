@@ -58,6 +58,10 @@ By using vLLM Ascend plugin, popular open-source models, including Transformer-l
 
 For detailed information on supported models and features, please refer to the [support matrix](https://docs.vllm.ai/projects/ascend/en/latest/user_guide/support_matrix/).
 
+This branch also provides experimental [Qwen NPU Ops worker adapters](examples/qwen_npu_ops/README.md)
+for R30 prefill and compact R22 decode. They require explicit worker selection
+and matching external operator payloads.
+
 ## DeepWiki
 
 [**DeepWiki**](https://deepwiki.com/vllm-project/vllm-ascend) is a dynamic knowledge base collaboratively maintained by the community and AI, designed to provide you with deeper technical insights beyond conventional documentation. If official documentation serves as a "quick start" guide to help you get going, the DeepWiki is your technical companion for "deep understanding". Here, you can explore: core architecture and design principles, key source code interpretations, technical context, and decision-making logic.

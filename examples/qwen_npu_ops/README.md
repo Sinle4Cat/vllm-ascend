@@ -1,0 +1,143 @@
+# Experimental Qwen NPU Ops integration
+
+This branch packages the explicit R30 prefill and compact R22 decode adapters
+as opt-in vLLM-Ascend workers. The normal `NPUWorker` and native GDN path are
+unchanged. No custom kernel source, model weights, datasets, machine paths or
+credentials are embedded in this integration.
+
+## Versions and scope
+
+- Framework base: official `v0.30.0rc2`, commit
+  `8fde6d4e335fe300e2b949aab0e31659cce0811d`.
+- Operator source: [Qwen NPU Ops](https://gitcode.com/sinle4cat/qwen_npu_ops),
+  commit `25d921329b0b2783eb00f9bb91dbe2fbc6132fb3`.
+- Model geometry: Qwen3.6-27B, TP4/PCP1, BF16 activations, FP32 SSM,
+  48 GDN layers, K7/Q8 or K8/Q9, `FULL_DECODE_ONLY`.
+- Historical validation environment: Ascend910B4, CANN9.2, torch2.10 and
+  torch_npu2.10.0.post7. Rebuild native payloads for their actual target.
+- Historical vLLM source: `ced6857afa0ea7b2e3f0846a62e1394e90f15607`.
+  Its Qwen model and DSpark checkpoint/graph compatibility changes remain
+  prerequisites for reproducing that deployment; this adapter does not
+  rewrite the upstream model or draft checkpoint.
+
+The R30/R22 adapter bodies originate from the operator repository's
+`integrations/vllm_ascend`. This branch places them in framework namespaces,
+uses relative imports and centralizes its configuration in `envs.py`.
+RoPE, projections, quantization and the scheduler remain on their installed
+framework paths. The historical joint R01 diagnostic worker is not activated.
+
+The operator repository's W-only preload remains an optional experiment.
+This integration does not apply its patch or select a W-only payload.
+Choose an R30 OPP built from the operator repository's unchanged `default`.
+
+## Install the explicit payloads
+
+Install this framework branch following the normal project installation
+instructions. Install the matching Qwen NPU Ops API or decode payload wheel.
+The operator repository provides `scripts/build_decode.py`,
+`scripts/build_gdn_prefill.sh` and `scripts/build_gdn_prefill_bridge.py`.
+Build and validate them against the actual CANN/torch_npu environment.
+The standalone decode wheel does not automatically bundle or register R30.
+
+Supply an R30 runtime identity JSON for the private OPP installation. Its
+`vendor` is an absolute private vendor directory; `payload` maps relative
+payload filenames to objects containing their `sha256` value;
+`payload_identity_sha256` identifies the complete payload. Use the exact
+identity retained by the operator build/validation, not a different OPP's
+report. The bridge must expose the dual-layout R30 ABI from the pinned source.
+
+Register the private R30 provider in `ASCEND_CUSTOM_OPP_PATH` **before**
+starting Python. Importing torch_npu/vLLM before this can freeze discovery of
+the wrong tiling provider. The adapter verifies recorded files and checks
+the resolved ACLNN provider during startup.
+
+## Persistent KV route
+
+Set these paths to the matching local artifacts and use a new output
+directory for each service attempt:
+
+```bash
+export VLLM_ASCEND_QWEN_PREFILL_ENABLE=1
+export VLLM_ASCEND_QWEN_PREFILL_IDENTITY=/path/to/r30-runtime-identity.json
+export VLLM_ASCEND_QWEN_PREFILL_BRIDGE=/path/to/qwen_gdn_prefill_r30_bridge.so
+export VLLM_ASCEND_QWEN_DECODE_PAYLOAD=/path/to/compact-r22-payload
+export VLLM_ASCEND_QWEN_OPS_RUN_DIR=/path/to/new-run/integration
+export ASCEND_CUSTOM_OPP_PATH="/path/to/private-opp/vendors/qwen_npu_ops_transformer:/path/to/private-opp${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
+export VLLM_USE_V2_MODEL_RUNNER=0
+
+# Set MAIN_MODEL and DRAFT_MODEL to the compatible local checkpoints.
+vllm serve "$MAIN_MODEL" \
+  --tensor-parallel-size 4 --dtype bfloat16 --quantization ascend \
+  --mamba-ssm-cache-dtype float32 --max-num-seqs 8 \
+  --max-model-len 32768 --max-num-batched-tokens 8320 \
+  --no-enable-prefix-caching --enable-chunked-prefill \
+  --worker-cls vllm_ascend.worker.qwen_npu_ops.kv_worker.QwenKvWorker \
+  --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"model\":\"$DRAFT_MODEL\"}" \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[64]}'
+```
+
+For K8, use `num_speculative_tokens:8` and the matching capture size 72 for
+eight sequences. The decode payload must include the actual batch/query
+buckets. Unbuilt buckets fail explicitly. Start with an empty cache;
+the worker rejects KV-transfer connectors because their layout contract is
+not qualified. Do not attach an old VK state snapshot to a KV worker.
+
+The worker changes allocation before cache initialization and keeps SSM
+state `[slot,head,K,V]` throughout. Pure or mixed prefill calls R30 per real
+sequence. Speculative, ragged and ordinary decode groups call R22 with
+`T=sum(lengths)` rows, original query starts, accepted counts and the complete
+`[batch,query]` page table. Sequences are not padded to equal token lengths.
+Null page 0 and inactive IDs are not written. The VK native core is rejected
+for a KV bank. Decode workspaces and bridge buffers are prepared before
+Graph capture and included in memory profiling.
+
+## VK prefill-only route
+
+Select `vllm_ascend.worker.qwen_npu_ops.prefill_worker.QwenPrefillWorker`
+to replace supported pure prefill while retaining the installed decode and
+RoPE implementations. SSM remains VK. Mixed/unsupported batches stay on that
+installed native route. Its decode backend must independently support the
+chosen speculative width; an old native `MAX_MTP=8` recurrence cannot handle
+K8/Q9. This worker does not silently patch that recurrence. Use the persistent
+KV worker for the complete compact R30/R22 route.
+
+For a matched VK wrapper baseline, set `VLLM_ASCEND_QWEN_PREFILL_ENABLE=0`
+with the same prefill worker and artifacts. The KV worker rejects disabling
+R30 because a native VK fallback cannot consume its state allocation.
+
+## Validation boundaries
+
+Run the CPU adapter tests without torch or an NPU:
+
+```bash
+python -m unittest discover -s tests/ut/ops -p test_qwen_npu_ops_adapter.py -v
+```
+
+Run the state-bridge regression on an authorized, idle NPU:
+
+```bash
+pytest -q tests/e2e/pull_request/one_card/ops/test_qwen_npu_ops_state_bridge.py
+```
+
+The latter checks KV/VK orientation, K7/K8 page widths, padded bank strides,
+inactive/null pages, eager execution and captured Graph replay. It does not
+require model weights or a custom GDN payload. Operator accuracy and
+prefill/decode handoff validators remain in the operator repository.
+
+Publication validation passed 7 CPU adapter tests, 8 NPU state-bridge tests
+and 90 compact/mixed NPU cases with the relocated framework modules.
+The NPU checks used Ascend910B4, CANN9.2 and torch_npu2.10.0.post7 with the
+retained R30/R22 payloads. They verify adapter relocation and state handling;
+they do not qualify a new operator build or a complete model deployment.
+
+Historical component evidence includes 152 R30 cases, 76 canonical KV/VK
+pairs, 90 compact/mixed cases and 32 state handoffs. The later full GSM8K
+KV campaign scored 1280/1319 for K7 and 1285/1319 for K8 after the tail fix.
+Those results belong to their frozen operator/framework/runtime artifacts,
+not to a fresh installation merely because its imports or unit tests pass.
+No new model accuracy or TTFT/TPOT gain is claimed by publishing this adapter.
+
+The route snapshot records per-rank providers, SSM layout, layer hits and
+dispatch counts under the explicit run directory. Python custom-op counters
+observe eager/capture calls; Graph replay does not execute those Python
+counters again.

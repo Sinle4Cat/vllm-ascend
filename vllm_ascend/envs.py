@@ -36,6 +36,24 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Explicit experimental Qwen R30/R22 workers only. Default: disabled (0).
+    # Valid values: 0 or 1. Not sensitive; the normal NPU worker ignores it.
+    "VLLM_ASCEND_QWEN_PREFILL_ENABLE": lambda: _strict_binary_env("VLLM_ASCEND_QWEN_PREFILL_ENABLE"),
+    # Verified private R30 identity JSON. Default: None; nonempty file path
+    # required by a Qwen worker. Not sensitive; never contains credentials.
+    "VLLM_ASCEND_QWEN_PREFILL_IDENTITY": lambda: os.getenv("VLLM_ASCEND_QWEN_PREFILL_IDENTITY"),
+    # Matching compiled R30 torch bridge. Default: None; shared-library path
+    # required by a Qwen worker. Not sensitive.
+    "VLLM_ASCEND_QWEN_PREFILL_BRIDGE": lambda: os.getenv("VLLM_ASCEND_QWEN_PREFILL_BRIDGE"),
+    # Compact K7/Q8 and/or K8/Q9 R22 payload directory. Default: None;
+    # required by the KV worker. Not sensitive.
+    "VLLM_ASCEND_QWEN_DECODE_PAYLOAD": lambda: os.getenv("VLLM_ASCEND_QWEN_DECODE_PAYLOAD"),
+    # Route-evidence output directory. Default: None; required by a Qwen
+    # worker. Use a new directory for each run. Not sensitive.
+    "VLLM_ASCEND_QWEN_OPS_RUN_DIR": lambda: os.getenv("VLLM_ASCEND_QWEN_OPS_RUN_DIR"),
+    # External CANN variable, configured before importing torch_npu/vLLM.
+    # Default: empty; colon-separated OPP directories on Linux. Not sensitive.
+    "ASCEND_CUSTOM_OPP_PATH": lambda: os.getenv("ASCEND_CUSTOM_OPP_PATH", ""),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
