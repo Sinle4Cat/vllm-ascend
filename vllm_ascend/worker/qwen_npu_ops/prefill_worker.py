@@ -16,7 +16,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend import envs
 from vllm_ascend.ops import gdn as gdn_module
+from vllm_ascend.ops.qwen_npu_ops.native_recurrent import NativeVkRecurrent
 from vllm_ascend.ops.qwen_npu_ops.prefill import GdnPrefill
+from vllm_ascend.ops.qwen_npu_ops.vk_chain import VkGdnChain
 from vllm_ascend.worker.worker import NPUWorker
 
 
@@ -41,6 +43,7 @@ class QwenPrefillWorker(NPUWorker):
             ssm_layout=getattr(self, "ssm_layout", "VK"),
         )
         self.prefill.prepare(torch.device("npu", torch.npu.current_device()))
+        self.vk_chain = VkGdnChain(self.prefill)
         self.prefill_enabled = envs.VLLM_ASCEND_QWEN_PREFILL_ENABLE
         self.prefill_calls = Counter()
         self.prefill_layers = set()
@@ -54,8 +57,15 @@ class QwenPrefillWorker(NPUWorker):
         ]
         assert len(sites) == 48
         self.prefill_sites = {layer.prefix: layer for _, layer in sites}
+        self.recurrent = None
+        if getattr(self, "ssm_layout", "VK") == "VK" and envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD:
+            self.recurrent = NativeVkRecurrent(envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD)
         for _, layer in sites:
             assert layer.num_spec in (7, 8) and layer.tp_size == 4
+            if self.recurrent is not None:
+                layer.qwen_recurrent = self.recurrent
+            elif layer.num_spec == 8 and getattr(self, "ssm_layout", "VK") == "VK":
+                raise ValueError("VK K8 requires the native Q9 recurrence payload")
 
         def core(
             qkv: torch.Tensor, z: torch.Tensor, b: torch.Tensor, a: torch.Tensor, output: torch.Tensor, prefix: str
@@ -67,10 +77,19 @@ class QwenPrefillWorker(NPUWorker):
             if meta is None:
                 return
             supported = self.prefill.supports(layer, meta, qkv, z, b, a)
-            if supported and self.prefill_enabled:
+            mixed_supported = getattr(self, "ssm_layout", "VK") == "VK" and self.vk_chain.supports(
+                layer, meta, qkv, z, b, a
+            )
+            if (supported or mixed_supported) and self.prefill_enabled:
                 gdn_module.wait_for_kv_layer_from_connector(prefix)
                 gdn_module.record_attention_compute_start()
-                count = self.prefill(layer, meta, qkv, z, b, a, output, gdn_module._get_packed_conv_weights(layer))
+                if mixed_supported:
+                    count = self.vk_chain(layer, meta, qkv, z, b, a, output)
+                    self.prefill_calls["r30_mixed_batches"] += 1
+                    self.prefill_calls["native_mixed_spec_groups"] += int(meta.spec_sequence_masks is not None)
+                    self.prefill_calls["native_mixed_decode_groups"] += int(meta.num_decodes > 0)
+                else:
+                    count = self.prefill(layer, meta, qkv, z, b, a, output, gdn_module._get_packed_conv_weights(layer))
                 self.prefill_calls["r30_sequences"] += count
                 self.prefill_calls["r30_batches"] += 1
                 self.prefill_layers.add(prefix)
@@ -194,8 +213,9 @@ class QwenPrefillWorker(NPUWorker):
             token_shapes=dict(self.prefill_shapes),
             prefill=self.prefill.status(),
             graph_calls=dict(self.graph_calls),
+            native_recurrent=None if self.recurrent is None else self.recurrent.identity,
             layout=self.prefill_layout,
-            scope="R30 pure prefill only; installed decode and RoPE retained",
+            scope="R30 pure/mixed/ragged prefill; native decode and RoPE retained",
         )
         if getattr(self, "ssm_layout", "VK") == "KV":
             result["scope"] = "persistent KV: mixed/ragged R30 Prefill and compact R22 K7/K8 Decode"

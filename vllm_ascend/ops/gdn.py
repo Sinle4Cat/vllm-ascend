@@ -534,6 +534,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2. Recurrent attention
         g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        recurrent = getattr(self, "qwen_recurrent", recurrent_gated_delta_rule)
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
                 g_spec = g
@@ -561,7 +562,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.spec_decode_metadata.actual_seq_lengths
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
-            core_attn_out_spec = recurrent_gated_delta_rule(
+            core_attn_out_spec = recurrent(
                 query_spec.squeeze(0),
                 key_spec.squeeze(0),
                 value_spec.squeeze(0),
@@ -586,7 +587,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_decode = l2norm_fwd(query_decode)
             key_decode = l2norm_fwd(key_decode)
-            core_attn_out_decode = recurrent_gated_delta_rule(
+            core_attn_out_decode = recurrent(
                 query_decode.squeeze(0),
                 key_decode.squeeze(0),
                 value_decode.squeeze(0),
@@ -707,7 +708,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_non_spec = l2norm_fwd(query_non_spec)
             key_non_spec = l2norm_fwd(key_non_spec)
-            core_attn_out_non_spec = recurrent_gated_delta_rule(
+            core_attn_out_non_spec = recurrent(
                 query_non_spec.squeeze(0),
                 key_non_spec.squeeze(0),
                 value_non_spec.squeeze(0),

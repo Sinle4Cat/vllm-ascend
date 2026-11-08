@@ -218,6 +218,37 @@ class QwenAdapterContracts(unittest.TestCase):
                     self.assertIs(gather.call_args.args[2], indices)
                     self.assertIs(scatter.call_args.args[2], indices)
 
+    def test_vk_mixed_contract_preserves_source_metadata(self):
+        module = load("vllm_ascend.ops.qwen_npu_ops.vk_chain", ADAPTER / "vk_chain.py")
+        prefill = Mock()
+        prefill.supports.return_value = True
+        chain = module.VkGdnChain(prefill)
+        meta = types.SimpleNamespace(
+            num_actual_tokens=137,
+            num_prefills=2,
+            num_decodes=1,
+            num_decode_tokens=1,
+            num_spec_decodes=2,
+            spec_sequence_masks=object(),
+            spec_token_indx=Tensor((7,)),
+            non_spec_token_indx=Tensor((130,)),
+            spec_decode_metadata=object(),
+            non_spec_decode_metadata=object(),
+        )
+        values = [Tensor((144, 2560)), Tensor((144, 12, 128)), Tensor((144, 12)), Tensor((144, 12))]
+        self.assertTrue(chain.supports(object(), meta, *values))
+        narrowed = prefill.supports.call_args.args[1]
+        self.assertEqual(narrowed.num_actual_tokens, 129)
+        self.assertEqual(narrowed.num_decodes, 0)
+        self.assertIsNone(narrowed.spec_sequence_masks)
+        self.assertEqual(meta.num_actual_tokens, 137)
+        self.assertEqual(meta.num_decodes, 1)
+        self.assertIsNotNone(meta.spec_sequence_masks)
+        with patch.object(meta, "non_spec_token_indx", Tensor((129,))):
+            self.assertFalse(chain.supports(object(), meta, *values))
+        with patch.object(meta, "num_decode_tokens", 2):
+            self.assertFalse(chain.supports(object(), meta, *values))
+
     def test_kv_worker_rejects_disabled_prefill_before_loading(self):
         # Import only the subclass; the heavy model-loading parent stays mocked.
         parent = types.SimpleNamespace(QwenPrefillWorker=type("Parent", (), {}))

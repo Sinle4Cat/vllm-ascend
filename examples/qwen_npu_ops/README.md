@@ -10,7 +10,7 @@ credentials are embedded in this integration.
 - Framework base: official `v0.30.0rc2`, commit
   `8fde6d4e335fe300e2b949aab0e31659cce0811d`.
 - Operator source: [Qwen NPU Ops](https://gitcode.com/sinle4cat/qwen_npu_ops),
-  commit `25d921329b0b2783eb00f9bb91dbe2fbc6132fb3`.
+  commit `04ffdbf013d1326f2384aee54737290c40bbc5bf`.
 - Model geometry: Qwen3.6-27B, TP4/PCP1, BF16 activations, FP32 SSM,
   48 GDN layers, K7/Q8 or K8/Q9, `FULL_DECODE_ONLY`.
 - Historical validation environment: Ascend910B4, CANN9.2, torch2.10 and
@@ -91,18 +91,35 @@ Null page 0 and inactive IDs are not written. The VK native core is rejected
 for a KV bank. Decode workspaces and bridge buffers are prepared before
 Graph capture and included in memory profiling.
 
-## VK prefill-only route
+## Persistent VK route
 
 Select `vllm_ascend.worker.qwen_npu_ops.prefill_worker.QwenPrefillWorker`
-to replace supported pure prefill while retaining the installed decode and
-RoPE implementations. SSM remains VK. Mixed/unsupported batches stay on that
-installed native route. Its decode backend must independently support the
-chosen speculative width; an old native `MAX_MTP=8` recurrence cannot handle
-K8/Q9. This worker does not silently patch that recurrence. Use the persistent
-KV worker for the complete compact R30/R22 route.
+to use R30 pure/mixed prefill with persistent VK state. RoPE remains on the
+installed framework path. The optional native recurrence payload preserves
+the original AscendC arithmetic while fixing compact-query/history indexing,
+accepted-history bounds and Q9 support. Build it in the operator repository:
+
+```bash
+python scripts/build_native_recurrent.py --output /path/to/new-native-vk-payload
+export VLLM_ASCEND_QWEN_DECODE_PAYLOAD=/path/to/new-native-vk-payload
+```
+
+Use the same R30 identity, bridge and private provider configuration above,
+but select `QwenPrefillWorker`. The recurrence payload is specialized for
+Ascend910B4, TP4 Qwen heads and BF16 activations with FP32 VK state; rebuild
+for the actual CANN/torch_npu runtime. It replaces recurrence per layer in
+both pure decode and mixed batches, preserving device-side real lengths,
+accepted counts and the complete page table. No equal-length query padding,
+full-state transpose/copy or recurrence HBM workspace is required. R30 keeps
+its reusable prefill workspace.
+
+Without the explicit payload, K7 retains the installed native recurrence;
+K8 fails during worker setup because the old `MAX_MTP=8` kernel cannot
+handle Q9. The separately packaged R22/KV payload remains a different route.
 
 For a matched VK wrapper baseline, set `VLLM_ASCEND_QWEN_PREFILL_ENABLE=0`
-with the same prefill worker and artifacts. The KV worker rejects disabling
+with the same prefill worker and native recurrence payload. This reference
+includes the same decode repair and is not unmodified official K8. The KV worker rejects disabling
 R30 because a native VK fallback cannot consume its state allocation.
 
 ## Validation boundaries
