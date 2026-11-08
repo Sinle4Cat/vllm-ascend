@@ -1,5 +1,7 @@
 # Experimental Qwen NPU Ops integration
 
+完整构建、配置和 K7/K8 启动步骤见 [Qwen NPU Ops 双仓使用指南](USAGE_zh.md)。
+
 This branch packages the explicit R30 prefill and compact R22 decode adapters
 as opt-in vLLM-Ascend workers. The normal `NPUWorker` and native GDN path are
 unchanged. No custom kernel source, model weights, datasets, machine paths or
@@ -158,3 +160,23 @@ The route snapshot records per-rank providers, SSM layout, layer hits and
 dispatch counts under the explicit run directory. Python custom-op counters
 observe eager/capture calls; Graph replay does not execute those Python
 counters again.
+
+## Latest VK recurrence repair validation
+
+The VK worker now supports mixed prefill/ordinary/speculative decode with
+compact real query lengths and full Q8/Q9 history tables. The explicit
+native recurrence build has the same binary SHA256 as the frozen 20002 model
+validation payload. It uses no recurrence HBM workspace; R30 prefill still
+retains its own reusable workspace. Default R30 and optional W-only sources
+were not changed.
+
+The publication candidate passed 8 CPU framework contracts and 84 NPU tests:
+22 independent native recurrence cases, 54 mixed VK cases and 8 KV/VK state
+bridge cases. Reproduce the targeted NPU checks with the commands in the
+Chinese usage guide. They include inactive/zero-length queries, B8, complete
+state and padding preservation, Q8 native parity and changed Graph metadata.
+
+The associated 20002 model run used a 64-question GSM8K subset. Native/R30
+scored 60/61 for K7 and 62/61 for K8. Both arms include the same decode repair.
+Those VK subset scores do not inherit the earlier KV full-dataset results
+and do not establish full-dataset equivalence.
