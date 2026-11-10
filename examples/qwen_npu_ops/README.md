@@ -2,8 +2,8 @@
 
 完整构建、配置和 K7/K8 启动步骤见 [Qwen NPU Ops 双仓使用指南](USAGE_zh.md)。
 
-This branch packages the explicit R30 prefill, compact R22 decode with R01 RoPE,
-and W8A8 decode QuantMatmul adapters
+This branch packages the R30 prefill, native VK decode, compact R22 decode with
+R01 RoPE, and W8A8 decode QuantMatmul adapters
 as opt-in vLLM-Ascend workers. The normal `NPUWorker` and native GDN path are
 unchanged. No custom kernel source, model weights, datasets, machine paths or
 credentials are embedded in this integration.
@@ -39,8 +39,11 @@ Choose an R30 OPP built from the operator repository's unchanged `default`.
 
 Install this framework branch following the normal project installation
 instructions. Install the matching Qwen NPU Ops API or decode payload wheel.
-Run `scripts/build_all.py` from the operator repository to build the three
-operator groups and generate an `activate.sh` for the KV worker.
+Run `scripts/build_all.py` from the operator repository to build both decode
+payloads and the common prefill and QuantMatmul payloads. Source the generated
+`activate.sh` and pass `--worker-cls "$QWEN_NPU_OPS_WORKER_CLS"` to serve.
+The activation defaults to Native VK. Set `QWEN_NPU_OPS_LAYOUT=kv` when
+sourcing the activation file to select the KV worker and R22/R01 payload.
 Build and validate them against the actual CANN/torch_npu environment.
 The standalone decode wheel does not automatically bundle or register R30.
 
@@ -56,7 +59,7 @@ starting Python. Importing torch_npu/vLLM before this can freeze discovery of
 the wrong tiling provider. The adapter verifies recorded files and checks
 the resolved ACLNN provider during startup.
 
-## Persistent KV route
+## Optional Persistent KV route
 
 Set these paths to the matching local artifacts and use a new output
 directory for each service attempt:
@@ -97,11 +100,11 @@ Null page 0 and inactive IDs are not written. The VK native core is rejected
 for a KV bank. Decode workspaces and bridge buffers are prepared before
 Graph capture and included in memory profiling.
 
-## Persistent VK route
+## Default Persistent VK route
 
 Select `vllm_ascend.worker.qwen_npu_ops.prefill_worker.QwenPrefillWorker`
 to use R30 pure/mixed prefill with persistent VK state. RoPE remains on the
-installed framework path. The optional native recurrence payload preserves
+installed framework path. The native VK recurrence payload preserves
 the original AscendC arithmetic while fixing compact-query/history indexing,
 accepted-history bounds and Q9 support. Build it in the operator repository:
 
