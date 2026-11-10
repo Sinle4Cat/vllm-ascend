@@ -2,7 +2,8 @@
 
 完整构建、配置和 K7/K8 启动步骤见 [Qwen NPU Ops 双仓使用指南](USAGE_zh.md)。
 
-This branch packages the explicit R30 prefill and compact R22 decode adapters
+This branch packages the explicit R30 prefill, compact R22 decode with R01 RoPE,
+and W8A8 decode QuantMatmul adapters
 as opt-in vLLM-Ascend workers. The normal `NPUWorker` and native GDN path are
 unchanged. No custom kernel source, model weights, datasets, machine paths or
 credentials are embedded in this integration.
@@ -25,8 +26,10 @@ credentials are embedded in this integration.
 The R30/R22 adapter bodies originate from the operator repository's
 `integrations/vllm_ascend`. This branch places them in framework namespaces,
 uses relative imports and centralizes its configuration in `envs.py`.
-RoPE, projections, quantization and the scheduler remain on their installed
-framework paths. The historical joint R01 diagnostic worker is not activated.
+The KV worker uses R01 for compatible RoPE calls and the installed fused
+RoPE for other inputs. With the QuantMatmul payload configured, supported
+decode GEMMs use the custom library, and other inputs use the installed
+QuantMatmul. The projections and scheduler retain their framework paths.
 
 The operator repository's W-only preload remains an optional experiment.
 This integration does not apply its patch or select a W-only payload.
@@ -36,8 +39,8 @@ Choose an R30 OPP built from the operator repository's unchanged `default`.
 
 Install this framework branch following the normal project installation
 instructions. Install the matching Qwen NPU Ops API or decode payload wheel.
-The operator repository provides `scripts/build_decode.py`,
-`scripts/build_gdn_prefill.sh` and `scripts/build_gdn_prefill_bridge.py`.
+Run `scripts/build_all.py` from the operator repository to build the three
+operator groups and generate an `activate.sh` for the KV worker.
 Build and validate them against the actual CANN/torch_npu environment.
 The standalone decode wheel does not automatically bundle or register R30.
 
@@ -63,6 +66,7 @@ export VLLM_ASCEND_QWEN_PREFILL_ENABLE=1
 export VLLM_ASCEND_QWEN_PREFILL_IDENTITY=/path/to/r30-runtime-identity.json
 export VLLM_ASCEND_QWEN_PREFILL_BRIDGE=/path/to/qwen_gdn_prefill_r30_bridge.so
 export VLLM_ASCEND_QWEN_DECODE_PAYLOAD=/path/to/compact-r22-payload
+export VLLM_ASCEND_QWEN_QUANT_MATMUL_PAYLOAD=/path/to/quant-matmul-payload
 export VLLM_ASCEND_QWEN_OPS_RUN_DIR=/path/to/new-run/integration
 export ASCEND_CUSTOM_OPP_PATH="/path/to/private-opp/vendors/qwen_npu_ops_transformer:/path/to/private-opp${ASCEND_CUSTOM_OPP_PATH:+:$ASCEND_CUSTOM_OPP_PATH}"
 export VLLM_USE_V2_MODEL_RUNNER=0

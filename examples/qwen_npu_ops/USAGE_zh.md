@@ -1,6 +1,6 @@
 # Qwen NPU Ops 双仓使用指南
 
-本指南覆盖 R30 prefill、持久 VK recurrence、持久 KV/R22 和可选的 W8A8 decode QuantMatmul。
+统一部署启用 R30 GDN Prefill、R22 GDN Decode + R01 RoPE 和 W8A8 decode QuantMatmul。
 算子源码放在 [qwen_npu_ops](https://gitcode.com/sinle4cat/qwen_npu_ops)，框架接入放在
 [vllm-ascend 的 qwen-npu-ops-v0.30 分支](https://github.com/Sinle4Cat/vllm-ascend/tree/qwen-npu-ops-v0.30)。
 
@@ -15,7 +15,7 @@
 
 | 仓库 | 职责 | 需要生成的产物 |
 | --- | --- | --- |
-| qwen_npu_ops | R30/R22/native VK 算子源码、编译脚本、Python API | 私有 R30 OPP、R30 bridge、匹配布局的 decode payload |
+| qwen_npu_ops | R30、R22/R01 和 QuantMatmul 源码、编译脚本、Python API | 私有 R30 OPP 和 bridge、R22/R01 payload、QuantMatmul payload |
 | vllm-ascend | worker、状态布局、混合批次路由、Graph 接入与回归测试 | 安装本分支；通过 worker 和环境变量显式启用 |
 
 默认 `NPUWorker` 不会因为安装算子包而自动启用这些接入。W-only 是独立可选实验，本指南不应用其 patch，也不替换 R30 `default`。
@@ -74,17 +74,18 @@ python3 scripts/build_all.py --output "$ARTIFACTS" --jobs 8
 source "$ARTIFACTS/activate.sh"
 ```
 
-`ARTIFACTS` 使用新的绝对路径。脚本构建并安装私有 R30 OPP，同时产出 bridge、Native VK、
-R22 K7/K8 B1–32、RoPE 和 QuantMatmul。激活后用下面的方式选择状态布局和 worker：
+`ARTIFACTS` 使用新的绝对路径。脚本构建并安装私有 R30 OPP，同时产出 bridge、
+R22 K7/K8 B1–32、R01 RoPE 和包含全部 45 个支持 shape 的 QuantMatmul。
+激活后选择持久 KV worker。
 
 ```bash
-export DECODE_PAYLOAD="$QWEN_NPU_OPS_NATIVE_VK"
-export WORKER=vllm_ascend.worker.qwen_npu_ops.prefill_worker.QwenPrefillWorker
+export DECODE_PAYLOAD="$VLLM_ASCEND_QWEN_DECODE_PAYLOAD"
+export WORKER=vllm_ascend.worker.qwen_npu_ops.kv_worker.QwenKvWorker
 ```
 
-使用 KV 布局时，选择 `$QWEN_NPU_OPS_R22` 和
-`vllm_ascend.worker.qwen_npu_ops.kv_worker.QwenKvWorker`，并设置 `VLLM_ASCEND_QWEN_PREFILL_ENABLE=1`。
-激活文件中的 `VLLM_ASCEND_QWEN_QUANT_MATMUL_PAYLOAD` 让两种 Qwen worker 在符合条件的 W8A8
+设置 `VLLM_ASCEND_QWEN_PREFILL_ENABLE=1` 启用 R30。KV worker 使用同一 decode payload 中的 R22 和
+R01，R01 支持 1–72 行及匹配的布局，超出支持范围走原生 RoPE。
+激活文件中的 `VLLM_ASCEND_QWEN_QUANT_MATMUL_PAYLOAD` 在符合条件的 W8A8
 decode 调用中启用 QuantMatmul。其余 shape、prefill 和混合批次走框架原生 QuantMatmul。
 清空该变量即可进行官方 QuantMatmul 对照。启用后可以在 `prefill_route_snapshot` 核对库身份和图捕获命中。
 
@@ -126,14 +127,14 @@ python3 scripts/build_gdn_prefill_bridge.py \
 构建和验证输出目录应使用新路径；脚本拒绝覆盖现有结果。
 必须在服务 Python 进程导入 torch_npu/vLLM **之前**配置私有 OPP，不能在模型加载后才切换 provider。
 
-## 选择 VK 或 KV decode
+## 分项构建 decode
 
 | 路径 | worker | decode payload | 状态合同 |
 | --- | --- | --- | --- |
-| 本轮 VK 路径 | `vllm_ascend.worker.qwen_npu_ops.prefill_worker.QwenPrefillWorker` | native VK，ABI `qwen-native-vk-recurrent-v1` | 持久 `[slot,head,V,K]`；修复 Q9/不等长 query；支持混合 prefill |
-| 可选 KV 路径 | `vllm_ascend.worker.qwen_npu_ops.kv_worker.QwenKvWorker` | compact R22，ABI `qwen-decode-direct-v1` | 持久 `[slot,head,K,V]`，R30/R22 全链路 KV |
+| 统一部署 | `vllm_ascend.worker.qwen_npu_ops.kv_worker.QwenKvWorker` | compact R22 + R01，ABI `qwen-decode-direct-v1` | 持久 `[slot,head,K,V]`，R30/R22 全链路 KV |
+| 历史 VK 路径 | `vllm_ascend.worker.qwen_npu_ops.prefill_worker.QwenPrefillWorker` | native VK，ABI `qwen-native-vk-recurrent-v1` | 持久 `[slot,head,V,K]`，原生 RoPE |
 
-本轮 VK 路径这样构建：
+单独构建历史 VK payload 的命令如下。
 
 ```bash
 cd "$OPS"
@@ -147,12 +148,12 @@ export WORKER=vllm_ascend.worker.qwen_npu_ops.prefill_worker.QwenPrefillWorker
 R30 按声明的 KV/VK ABI 处理输入；VK prefill 的内部布局适配仍存在，不能把整条链路描述成完全无布局转换。
 原版 `MAX_MTP=8` recurrence 不支持 K8/Q9，因此 VK K8 缺少此 payload 时会在 worker 启动阶段明确报错。
 
-只有选择 KV/R22 时，改为：
+单独构建 R22 + R01 的命令如下。缺省构建 B1–32 的两个 Q 档。
 
 ```bash
 cd "$OPS"
 python3 scripts/build_decode.py --cann-version 9.2.0 \
-  --batches 1 2 3 4 5 6 7 8 --queries 8 9 --output "$ARTIFACTS/r22-k7-k8"
+  --queries 8 9 --output "$ARTIFACTS/r22-k7-k8"
 export DECODE_PAYLOAD="$ARTIFACTS/r22-k7-k8"
 export WORKER=vllm_ascend.worker.qwen_npu_ops.kv_worker.QwenKvWorker
 ```
@@ -168,7 +169,7 @@ KV worker 要求启用 R30，且不支持未经验证的跨布局 KV transfer co
 ```bash
 export MAIN_MODEL=/absolute/path/to/main-model
 export DRAFT_MODEL=/absolute/path/to/draft-model
-export RUN_DIR="$WORK_ROOT/runs/vk-k8-001"
+export RUN_DIR="$WORK_ROOT/runs/kv-k8-001"
 test ! -e "$RUN_DIR"
 mkdir -p "$RUN_DIR/integration"
 export VLLM_ASCEND_QWEN_PREFILL_ENABLE=1
@@ -200,9 +201,9 @@ vllm serve "$MAIN_MODEL" --served-model-name qwen --host 127.0.0.1 --port 49018 
 ```
 
 `13958643712` 是本次用户选定的 **13 GiB/卡**，不是所有设备/负载通用的默认值。
-在本轮 910B4 32GiB、上述配置下，K7/K8 各两轮共 50 请求通过，包括八并发满 32K；
-token 容量分别为 388,918/370,688，最低采样空闲约 571/251 MiB。
-K8 未达到本轮设定的 512MiB 余量线。改变并发、capture、batched tokens 或 payload 后应重新测容量。
+历史 VK 路径的 13 GiB 容量测试中，K7/K8 各两轮共 50 请求通过，包括八并发满 32K；
+token 容量分别为 388,918/370,688，最低采样空闲约 571/251 MiB。KV/R22 使用自己的 bridge 和
+workspace，改变布局、并发、capture、batched tokens 或 payload 后应重新测容量。
 显式 cache bytes 覆盖按 utilization 自动推算的预算；日志中的实际 block/capacity 才是分配结果。
 
 ## 确认模型和接入路径
@@ -220,8 +221,9 @@ curl -sSf http://127.0.0.1:49018/collective_rpc \
   -d '{"method":"prefill_route_snapshot","args":["after-smoke"]}'
 ```
 
-核对四 rank、48 层、布局、实际 provider/payload 身份和 `r30_sequences`。
-VK native payload 应报告 `workspace_bytes=0`；不能因此把 R30 workspace 也算成 0。
+核对四 rank、48 个 GDN 层、KV 布局、实际 provider/payload 身份和 `r30_sequences`。
+检查 `kv_chain_calls` 的 R22 capture、`rope.capture_hits` 的 R01 命中和
+`quant_matmul.capture_hits` 的 W8A8 decode 命中。
 Graph replay 不再执行 Python 计数器，因此计数不增长不能单独证明 replay 没走算子。
 首次加载/图编译不计入热态 TTFT/TPOT；health、真实生成、计数和最终答案应分别检查。
 

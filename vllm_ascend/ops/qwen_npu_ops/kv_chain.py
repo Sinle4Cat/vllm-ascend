@@ -15,10 +15,13 @@ class KvGdnChain:
         self.bridges, self.workspaces = {}, {}
         self.calls = Counter()
 
-    def prepare(self, conv, state):
-        for batch, query in self.decode.buckets:
-            if query + 2 != conv.shape[1]:
-                continue
+    def prepare(self, conv, state, *, max_batch):
+        query = conv.shape[1] - 2
+        required = {(batch, query) for batch in range(1, max_batch + 1)}
+        missing = required.difference(self.decode.buckets)
+        if missing:
+            raise ValueError(f"Missing R22 decode buckets for configured concurrency: {sorted(missing)}")
+        for batch in range(1, max_batch + 1):
             key = (batch, query)
             if key in self.bridges:
                 continue
@@ -71,6 +74,8 @@ class KvGdnChain:
         )
         scatter(conv, state, full_ids, buffers)
         self.calls[f"r22_kv_B{key[0]}_Q{query}"] += 1
+        if torch.npu.is_current_stream_capturing():
+            self.calls[f"r22_capture_B{batch}_Q{query}"] += 1
         self.calls["r22_logical_sequences"] += batch
         self.calls["r22_logical_tokens"] += rows
         return result[:rows]

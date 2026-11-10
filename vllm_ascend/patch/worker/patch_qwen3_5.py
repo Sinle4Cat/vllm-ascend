@@ -45,24 +45,60 @@ def _uses_multimodal_rope(attention: Qwen3NextAttention) -> bool:
     return "qwen3_5" in attention.config.model_type and hasattr(attention.rotary_emb, "mrope_section")
 
 
+def native_qwen_mrope(
+    qkv,
+    q_weight,
+    k_weight,
+    cache,
+    positions,
+    *,
+    num_q_heads,
+    num_kv_heads,
+    head_size,
+    eps,
+    mrope_section,
+    is_interleaved,
+    rope_dim,
+    has_gate,
+):
+    # Text positions can be 1D, while the fused kernel reads three planes.
+    if positions.ndim == 1:
+        positions = positions.unsqueeze(0).expand(3, -1)
+    cos_sin = cache[positions]
+    if cos_sin.device != qkv.device:
+        cos_sin = cos_sin.to(qkv.device)
+    if cos_sin.dtype != qkv.dtype:
+        cos_sin = cos_sin.to(qkv.dtype)
+    return torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
+        qkv=qkv,
+        q_weight=1.0 + q_weight,
+        k_weight=1.0 + k_weight,
+        cos_sin=cos_sin,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        eps=eps,
+        mrope_section=mrope_section,
+        is_interleaved=is_interleaved,
+        rope_dim=rope_dim,
+        has_gate=has_gate,
+    )
+
+
 class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, output: torch.Tensor = None):
         qkv, _ = self.qkv_proj(hidden_states)
-        if _uses_multimodal_rope(self):
-            # MRV2 MTP uses 1D text positions; the fused kernel reads three planes.
-            if positions.ndim == 1:
-                positions = positions.unsqueeze(0).expand(3, -1)
-            cos_sin = self.rotary_emb.cos_sin_cache[positions]
-            if cos_sin.device != qkv.device:
-                cos_sin = cos_sin.to(qkv.device)
-            if cos_sin.dtype != qkv.dtype:
-                cos_sin = cos_sin.to(qkv.dtype)
-
-            q, k, v, gate = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
-                qkv=qkv,
-                q_weight=1.0 + self.q_norm.weight,
-                k_weight=1.0 + self.k_norm.weight,
-                cos_sin=cos_sin,
+        if getattr(self, "_qwen_rope_r01", False):
+            q, k, v, gate = torch.ops.vllm.qwen_rope_r01(
+                qkv, self.q_norm.weight, self.k_norm.weight, self.rotary_emb.cos_sin_cache, positions
+            )
+        elif _uses_multimodal_rope(self):
+            q, k, v, gate = native_qwen_mrope(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                positions,
                 num_q_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_dim,

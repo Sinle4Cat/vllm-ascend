@@ -22,9 +22,11 @@ class QwenKvWorker(QwenPrefillWorker):
         if self.vllm_config.kv_transfer_config is not None:
             raise ValueError("Persistent KV requires a layout-aware connector; none is qualified here")
         super().load_model()
-        self.kv_chain = KvGdnChain(
-            GdnDecode(envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD, allow_experimental=True), self.prefill
-        )
+        from vllm_ascend.ops.qwen_npu_ops.rope import QwenRopeAdapter
+
+        payload = envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD
+        self.kv_chain = KvGdnChain(GdnDecode(payload, allow_experimental=True), self.prefill)
+        self.rope = QwenRopeAdapter(payload, self.model_runner.get_model())
         for layer in self.prefill_sites.values():
             vk_shapes = layer.get_state_shape
 
@@ -48,11 +50,12 @@ class QwenKvWorker(QwenPrefillWorker):
         self.kv_chain.prepare(
             torch.empty((1, example.num_spec + 3, 2560), dtype=torch.bfloat16, device=device),
             torch.empty((1, 12, 128, 128), dtype=torch.float32, device=device),
+            max_batch=self.vllm_config.scheduler_config.max_num_seqs,
         )
 
     def initialize_from_config(self, config):
         super().initialize_from_config(config)
         for layer in self.prefill_sites.values():
-            self.kv_chain.prepare(*layer.kv_cache[:2])
+            self.kv_chain.prepare(*layer.kv_cache[:2], max_batch=self.vllm_config.scheduler_config.max_num_seqs)
         for row in self.prefill_layout:
             row["ssm_layout"] = "KV"

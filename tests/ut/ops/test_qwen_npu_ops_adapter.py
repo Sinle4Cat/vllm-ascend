@@ -69,6 +69,8 @@ class QwenAdapterContracts(unittest.TestCase):
         torch = types.ModuleType("torch")
         torch.bfloat16, torch.float32, torch.int32 = "bf16", "fp32", "i32"
         torch.ones = lambda count, **kwargs: Tensor((count,), "i32")
+        torch.empty = lambda shape, **kwargs: Tensor(shape, kwargs["dtype"])
+        torch.npu = types.SimpleNamespace(is_current_stream_capturing=lambda: True)
         utils = types.SimpleNamespace(
             triton=types.SimpleNamespace(jit=lambda f: f), tl=types.SimpleNamespace(constexpr=object())
         )
@@ -217,6 +219,53 @@ class QwenAdapterContracts(unittest.TestCase):
                     self.assertIs(decode.call_args.args[11], accepted)
                     self.assertIs(gather.call_args.args[2], indices)
                     self.assertIs(scatter.call_args.args[2], indices)
+                    self.assertEqual(chain.calls[f"r22_capture_B4_Q{query}"], 1)
+
+    def test_decode_workspace_is_bounded_by_configured_batch(self):
+        prefix = "vllm_ascend.ops.qwen_npu_ops"
+        load(prefix + ".state_bridge", ADAPTER / "state_bridge.py")
+        chain_module = load(prefix + ".kv_chain", ADAPTER / "kv_chain.py")
+        decode = Mock(buckets=tuple((batch, query) for batch in range(1, 33) for query in (8, 9)))
+        chain = chain_module.KvGdnChain(decode, Mock())
+        conv, state = Tensor((1, 11, 2560)), Tensor((1, 12, 128, 128), "fp32")
+        with patch.object(chain_module, "prepare"):
+            chain.prepare(conv, state, max_batch=8)
+            chain.prepare(conv, state, max_batch=8)
+            self.assertEqual(set(chain.bridges), {(batch, 9) for batch in range(1, 9)})
+            self.assertEqual(decode.allocate_workspace.call_count, 8)
+            with self.assertRaisesRegex(ValueError, "Missing R22"):
+                chain.prepare(conv, state, max_batch=33)
+
+    def test_rope_uses_r01_for_supported_inputs_and_native_for_others(self):
+        rope = Mock()
+        native = Mock()
+        sys.modules["qwen_npu_ops"].Rope = Mock(return_value=rope)
+        sys.modules["vllm.utils.torch_utils"] = types.SimpleNamespace(direct_register_custom_op=Mock())
+        sys.modules["torch"].Tensor = Tensor
+        sys.modules["vllm_ascend.patch.worker.patch_qwen3_5"] = types.SimpleNamespace(
+            Qwen3NextAttention=Mock, _uses_multimodal_rope=Mock(return_value=True), native_qwen_mrope=native
+        )
+        module = load("qwen_rope_contract", ADAPTER / "rope.py")
+        layer = Mock(
+            num_heads=6,
+            num_kv_heads=1,
+            head_dim=256,
+            attn_output_gate=True,
+            config=types.SimpleNamespace(rms_norm_eps=1e-6),
+            rotary_emb=types.SimpleNamespace(mrope_section=(11, 11, 10), mrope_interleaved=True, rotary_dim=64),
+        )
+        layers = [(f"model.layers.{i}.self_attn", layer) for i in range(16)]
+        adapter = module.QwenRopeAdapter("fixture", Mock(named_modules=Mock(return_value=layers)))
+        self.assertTrue(layer._qwen_rope_r01)
+        args = Tensor((72, 3584)), *[Mock() for _ in range(4)]
+        rope.supports.return_value = True
+        self.assertIs(adapter.execute(*args), rope.return_value)
+        self.assertEqual(adapter.snapshot()["capture_hits"], {"M72": 1})
+        rope.supports.return_value = False
+        args = Tensor((73, 3584)), *args[1:]
+        self.assertIs(adapter.execute(*args), native.return_value)
+        self.assertEqual(native.call_args.args, args)
+        self.assertEqual(adapter.snapshot()["calls"], {"r01_M72": 1, "native_M73": 1})
 
     def test_vk_mixed_contract_preserves_source_metadata(self):
         module = load("vllm_ascend.ops.qwen_npu_ops.vk_chain", ADAPTER / "vk_chain.py")

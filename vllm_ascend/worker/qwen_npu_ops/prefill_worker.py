@@ -228,9 +228,10 @@ class QwenPrefillWorker(NPUWorker):
             scope="R30 pure/mixed/ragged prefill; native decode and RoPE retained",
         )
         if getattr(self, "ssm_layout", "VK") == "KV":
-            result["scope"] = "persistent KV: mixed/ragged R30 Prefill and compact R22 K7/K8 Decode"
+            result["scope"] = "persistent KV: R30 Prefill, R22 K7/K8 Decode and R01 RoPE"
             result["ssm_layout"] = "KV"
             result["kv_chain_calls"] = dict(self.kv_chain.calls) if hasattr(self, "kv_chain") else {}
+            result["rope"] = self.rope.snapshot() if hasattr(self, "rope") else None
         folder = Path(envs.VLLM_ASCEND_QWEN_OPS_RUN_DIR)
         folder.mkdir(parents=True, exist_ok=True)
         with (folder / f"prefill-route-{label}-rank{self.rank}.json").open("x") as stream:
