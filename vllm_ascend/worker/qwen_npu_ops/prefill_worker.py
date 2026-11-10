@@ -32,7 +32,16 @@ class QwenPrefillWorker(NPUWorker):
             )
         ):
             raise ValueError("Qwen workers require explicit prefill identity, bridge and run-directory paths")
+        self.quant_matmul = None
+        payload = envs.VLLM_ASCEND_QWEN_QUANT_MATMUL_PAYLOAD
+        if payload:
+            from vllm_ascend.ops.qwen_npu_ops.quant_matmul import QuantMatmulAdapter
+
+            self.quant_matmul = QuantMatmulAdapter(payload)
+            self.quant_matmul.install()
         super().load_model()
+        if self.quant_matmul is not None:
+            self.quant_matmul.prepare_model(self.model_runner.get_model())
         from vllm.config import CUDAGraphMode
 
         assert self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
@@ -213,6 +222,7 @@ class QwenPrefillWorker(NPUWorker):
             token_shapes=dict(self.prefill_shapes),
             prefill=self.prefill.status(),
             graph_calls=dict(self.graph_calls),
+            quant_matmul=None if self.quant_matmul is None else self.quant_matmul.snapshot(),
             native_recurrent=None if self.recurrent is None else self.recurrent.identity,
             layout=self.prefill_layout,
             scope="R30 pure/mixed/ragged prefill; native decode and RoPE retained",

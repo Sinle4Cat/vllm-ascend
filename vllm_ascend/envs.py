@@ -48,6 +48,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Compact K7/Q8 and/or K8/Q9 R22 payload directory. Default: None;
     # required by the KV worker. Not sensitive.
     "VLLM_ASCEND_QWEN_DECODE_PAYLOAD": lambda: os.getenv("VLLM_ASCEND_QWEN_DECODE_PAYLOAD"),
+    # Optional W8A8 decode QuantMatmul payload directory for Qwen workers.
+    # Default: None (native QuantMatmul). Not sensitive.
+    "VLLM_ASCEND_QWEN_QUANT_MATMUL_PAYLOAD": lambda: os.getenv("VLLM_ASCEND_QWEN_QUANT_MATMUL_PAYLOAD"),
     # Route-evidence output directory. Default: None; required by a Qwen
     # worker. Use a new directory for each run. Not sensitive.
     "VLLM_ASCEND_QWEN_OPS_RUN_DIR": lambda: os.getenv("VLLM_ASCEND_QWEN_OPS_RUN_DIR"),

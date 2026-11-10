@@ -1,10 +1,10 @@
 # Qwen NPU Ops 双仓使用指南
 
-本指南对应本分支的 R30 prefill、持久 VK 原生 recurrence 修复，以及可选的持久 KV/R22 接入。
+本指南覆盖 R30 prefill、持久 VK recurrence、持久 KV/R22 和可选的 W8A8 decode QuantMatmul。
 算子源码放在 [qwen_npu_ops](https://gitcode.com/sinle4cat/qwen_npu_ops)，框架接入放在
 [vllm-ascend 的 qwen-npu-ops-v0.30 分支](https://github.com/Sinle4Cat/vllm-ascend/tree/qwen-npu-ops-v0.30)。
 
-配套功能提交如下，包含这些提交的后续文档版本也适用。
+历史 R30/R22/VK 接入的最低功能提交如下。统一构建和 QuantMatmul 使用表中分支的当前版本。
 
 | 仓库 | 分支 | 功能提交 |
 | --- | --- | --- |
@@ -49,10 +49,7 @@ git -c core.autocrlf=false clone --branch qwen-npu-ops-v0.30 \
 
 export OPS="$WORK_ROOT/qwen_npu_ops"
 export FRAMEWORK="$WORK_ROOT/vllm-ascend"
-git -C "$OPS" checkout 04ffdbf013d1326f2384aee54737290c40bbc5bf
-git -C "$FRAMEWORK" checkout d41239245b900e11478d95762cab0d1af2d155b7
-export ARTIFACTS="$WORK_ROOT/artifacts"
-mkdir -p "$ARTIFACTS"
+export ARTIFACTS="$WORK_ROOT/artifacts-r001"
 git -C "$FRAMEWORK" submodule update --init --recursive
 git -C "$FRAMEWORK" submodule status
 git -C "$OPS" rev-parse HEAD
@@ -69,7 +66,29 @@ python3 -m pip install --no-build-isolation --no-deps -e "$FRAMEWORK"
 `--no-deps --no-build-isolation` 保留事先配置的匹配运行时；依赖需要由前置环境准备齐全。
 算子 Python 包安装成功不代表已包含或编译了以下二进制产物。
 
-## 构建 R30 prefill
+## 一次构建全部算子
+
+```bash
+cd "$OPS"
+python3 scripts/build_all.py --output "$ARTIFACTS" --jobs 8
+source "$ARTIFACTS/activate.sh"
+```
+
+`ARTIFACTS` 使用新的绝对路径。脚本构建并安装私有 R30 OPP，同时产出 bridge、Native VK、
+R22 K7/K8 B1–32、RoPE 和 QuantMatmul。激活后用下面的方式选择状态布局和 worker：
+
+```bash
+export DECODE_PAYLOAD="$QWEN_NPU_OPS_NATIVE_VK"
+export WORKER=vllm_ascend.worker.qwen_npu_ops.prefill_worker.QwenPrefillWorker
+```
+
+使用 KV 布局时，选择 `$QWEN_NPU_OPS_R22` 和
+`vllm_ascend.worker.qwen_npu_ops.kv_worker.QwenKvWorker`，并设置 `VLLM_ASCEND_QWEN_PREFILL_ENABLE=1`。
+激活文件中的 `VLLM_ASCEND_QWEN_QUANT_MATMUL_PAYLOAD` 让两种 Qwen worker 在符合条件的 W8A8
+decode 调用中启用 QuantMatmul。其余 shape、prefill 和混合批次走框架原生 QuantMatmul。
+清空该变量即可进行官方 QuantMatmul 对照。启用后可以在 `prefill_route_snapshot` 核对库身份和图捕获命中。
+
+## 分项构建 R30 prefill
 
 ```bash
 cd "$OPS"
