@@ -24,8 +24,8 @@ credentials are embedded in this integration.
   rewrite the upstream model or draft checkpoint.
 
 This branch adds MTP3/Q4 support to the current operator/framework candidate.
-It requires a new payload and independent qualification; the historical
-operator commit and validation above do not include Q4.
+Its bounded Q4 operator and native-prefill model qualification is described
+below; the historical operator commit and validation above do not include Q4.
 
 The R30/R22 adapter bodies originate from the operator repository's
 `integrations/vllm_ascend`. This branch places them in framework namespaces,
@@ -99,11 +99,26 @@ For K3, use `num_speculative_tokens:3` and capture size32 at concurrency8.
 The KV payload must include Q4 and uses six Conv history rows. Native VK stays
 the default; its new manifest must explicitly declare Q4 in supported_queries.
 Legacy manifests keep their original Q1/Q8/Q9 capabilities and reject Q4.
-Q4 is newly implemented and awaits target operator/model qualification; the
-historical K7/K8 scores do not qualify it. R01 RoPE remains M1..72: Q4/C8 M32
-is covered, while M128 uses the existing native fallback. VK keeps native RoPE.
+Q4 KV/VK B1..32 full/compact-ragged operators and state checks passed, with
+Graph coverage at B1/B4/B8/B32. The qualified K3 model configuration uses
+default VK, new Q4 recurrence and unchanged QuantMatmul, with native prefill:
 
-The worker changes allocation before cache initialization and keeps SSM
+```bash
+QWEN_NPU_OPS_LAYOUT=vk source "$ARTIFACTS/activate.sh"
+export VLLM_ASCEND_QWEN_PREFILL_ENABLE=0
+```
+
+Keep the generated identity/bridge/payload paths. On Qwen3.8-27B-W8A8 TP4/PCP1,
+BF16/FP32, C8, graph32, seed1024,13GiB and max output24000, frozen GSM8K64
+scored61/64 with all64 token/text outputs exactly matching the fresh official
+K3 baseline. The R30-on configuration scored60/64 versus61/64 and retains its
+NoLower FAIL; the toggle result is not a claim that R30 was fixed. KV model
+qualification is not inferred from the VK score; only KV operator qualification
+is claimed here. Historical K7/K8 scores retain their original scope. No new
+speedup or full1319 result is claimed. R01 RoPE stays M1..72: M32 is covered,
+M128 uses existing fallback, and default VK retains native RoPE.
+
+The KV worker changes allocation before cache initialization and keeps SSM
 state `[slot,head,K,V]` throughout. Pure or mixed prefill calls R30 per real
 sequence. Speculative, ragged and ordinary decode groups call R22 with
 `T=sum(lengths)` rows, original query starts, accepted counts and the complete

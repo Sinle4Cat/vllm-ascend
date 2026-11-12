@@ -3,7 +3,8 @@
 统一部署默认启用 R30 GDN Prefill、Native VK Decode 和 W8A8 decode QuantMatmul，RoPE 使用原生实现。
 可显式切换到 R22 GDN Decode + R01 RoPE 的 KV 路径。
 
-新增 MTP=3 对应 Q4，C8 的 decode Graph capture size 为 32，Conv history 为 6 行。Native VK manifest 必须明确声明 `supported_queries` 包含 Q4；旧 manifest 继续仅开放 Q1/Q8/Q9，不会被自动视为 Q4 payload。默认 KV 构建包含 Q4/Q8/Q9 的 B1–32 加 RoPE，共 97 个对象。本能力尚待目标环境的算子与模型验收，历史 K7/K8 结果不能作为 Q4 验收。R01 的 M1–72 范围不变，Q4/C8 的 M32 可命中，M128 仍走已有 native fallback；默认 VK 继续使用原生 RoPE。
+MTP=3 对应 Q4，C8 的 decode Graph capture size 为 32，Conv history 为 6 行。Native VK manifest 必须明确声明 `supported_queries` 包含 Q4；旧 manifest 继续仅开放 Q1/Q8/Q9。默认 KV 构建包含 Q4/Q8/Q9 的 B1–32 加 RoPE，共 97 个对象。Q4 两布局的 B1–32 full/真实 compact ragged 算子和状态验证已通过，Graph 覆盖 B1/B4/B8/B32。
+当前 K3 模型通过配置为默认 VK、新 native Q4 与原 QuantMatmul，必须在激活后显式 `export VLLM_ASCEND_QWEN_PREFILL_ENABLE=0` 使用原生 prefill。Qwen3.8-27B-W8A8 TP4/PCP1、BF16/FP32、C8、graph32、seed1024、13 GiB、max output24000 的固定 GSM8K64 得分 61/64，64 条完整 token/text 与同次官方 K3 基线完全一致。原 R30-on 组合 60/64 对 61/64，NoLower FAIL 保留；不称 R30 已修复。KV 此处仅声明算子资格，不提前声明 KV 模型 smoke 或借用 VK 分数。历史 K7/K8 分数归原产物，无新 speedup 或完整 1319 题结论。R01 仍为 M1–72，M32 可命中，M128 仍走已有 fallback；默认 VK 保留原生 RoPE。
 算子源码放在 [qwen_npu_ops](https://gitcode.com/sinle4cat/qwen_npu_ops)，框架接入放在
 [vllm-ascend 的 qwen-npu-ops-v0.30 分支](https://github.com/Sinle4Cat/vllm-ascend/tree/qwen-npu-ops-v0.30)。
 
@@ -30,7 +31,7 @@
 - 驱动 26.1.1、CANN 9.2、torch 2.10、torch_npu 2.10.0.post7。
 - vLLM-Ascend 基于 `v0.30.0rc2`；历史 vLLM core 为 `ced6857afa0ea7b2e3f0846a62e1394e90f15607`。
 - 主模型满足 Qwen TP4 分片几何：Q/K heads=4、value heads=12、K=V=128、48 个 GDN 层。
-- K7 使用 Q8，K8 使用 Q9；本指南使用 `FULL_DECODE_ONLY` 和旧 model runner。
+- K3 使用 Q4，K7 使用 Q8，K8 使用 Q9；本指南使用 `FULL_DECODE_ONLY` 和旧 model runner。
 
 先准备含兼容 Qwen 模型、DSpark checkpoint/Graph 支持、`fla_npu.ops.ascendc`、CANN 和 ATB 的 vLLM 环境。
 这两个仓库不包含主模型/draft 权重，也不替换 vLLM core；仅安装 stock vLLM 不能据此认定具备历史部署的全部模型兼容修改。
@@ -78,7 +79,7 @@ source "$ARTIFACTS/activate.sh"
 ```
 
 `ARTIFACTS` 使用新的绝对路径。脚本构建并安装私有 R30 OPP，同时产出 bridge、Native VK、
-R22 K7/K8 B1–32、R01 RoPE 和包含全部 45 个支持 shape 的 QuantMatmul。
+R22 K3/K7/K8 B1–32、R01 RoPE 和包含全部 45 个支持 shape 的 QuantMatmul。
 激活文件默认将 `VLLM_ASCEND_QWEN_DECODE_PAYLOAD` 指向 `native-vk`，
 并将 `QWEN_NPU_OPS_WORKER_CLS` 设为 `QwenPrefillWorker` 的完整类名。
 如需 R22/R01，显式选择 KV。
@@ -152,19 +153,32 @@ export QWEN_NPU_OPS_WORKER_CLS=vllm_ascend.worker.qwen_npu_ops.prefill_worker.Qw
 R30 按声明的 KV/VK ABI 处理输入；VK prefill 的内部布局适配仍存在，不能把整条链路描述成完全无布局转换。
 原版 `MAX_MTP=8` recurrence 不支持 K8/Q9，因此 VK K8 缺少此 payload 时会在 worker 启动阶段明确报错。
 
-单独构建 R22 + R01 的命令如下。缺省构建 B1–32 的两个 Q 档。
+单独构建 R22 + R01 的命令如下。缺省构建 B1–32 的 Q4/Q8/Q9 三档与 RoPE，共 97 个对象。
 
 ```bash
 cd "$OPS"
 python3 scripts/build_decode.py --cann-version 9.2.0 \
-  --queries 8 9 --output "$ARTIFACTS/r22-k7-k8"
-export VLLM_ASCEND_QWEN_DECODE_PAYLOAD="$ARTIFACTS/r22-k7-k8"
+  --queries 4 8 9 --output "$ARTIFACTS/r22-k3-k7-k8"
+export VLLM_ASCEND_QWEN_DECODE_PAYLOAD="$ARTIFACTS/r22-k3-k7-k8"
 export QWEN_NPU_OPS_WORKER_CLS=vllm_ascend.worker.qwen_npu_ops.kv_worker.QwenKvWorker
 ```
 
 `--cann-version` 必须与实际 toolkit 一致。缺少实际 B/Q bucket 时不会隐式换用另一布局的 kernel。
 两个布局的 payload 不可互换；切换 worker 必须重新启动并创建空缓存，不复用旧 SSM snapshot。
 KV worker 要求启用 R30，且不支持未经验证的跨布局 KV transfer connector。
+
+K3 模型资格仅适用于上文的原生 prefill VK 配置。最后一次激活后执行：
+
+```bash
+QWEN_NPU_OPS_LAYOUT=vk source "$ARTIFACTS/activate.sh"
+export VLLM_ASCEND_QWEN_PREFILL_ENABLE=0
+```
+
+启动参数使用 `num_speculative_tokens=3` 和 `cudagraph_capture_sizes:[32]`，其他固定64测试参数保持不变。
+下节 K7/K8 示例中的 `PREFILL_ENABLE=1` 不适用于这一 K3 已通过配置，不能覆盖上述显式设置。
+算子代码/manifest 身份为 `0a865cff2ca81268b3a411249076bc226bd1769e`，框架代码身份为
+`0838f36b7006a9304a887ffde83ba247e513f6fa`；实际编译用 `ed1395eaa469b9575b1781fd5b4e540ba3a3949d`，
+仅 EOL 元数据后继 0a865cff 与其 compiler leaves 完全一致。后续文档 HEAD 不代表二进制重新构建。
 
 ## 启动 K7 或 K8
 
