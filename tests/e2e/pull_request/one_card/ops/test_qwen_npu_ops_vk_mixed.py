@@ -60,15 +60,20 @@ def prefill():
 
 @pytest.mark.parametrize("spec,ordinary", [(True, True), (True, False), (False, True)])
 @pytest.mark.parametrize("lengths", [(1, 17), (63, 65), (127, 129)])
-@pytest.mark.parametrize("query,ragged", [(8, False), (8, True), (9, False), (9, True), (8, "zero"), (9, "zero")])
+@pytest.mark.parametrize(
+    "query,ragged",
+    [(4, False), (4, True), (4, "zero"), (8, False), (8, True), (9, False), (9, True), (8, "zero"), (9, "zero")],
+)
 def test_vk_mixed_ragged_prefill_decode(prefill, spec, ordinary, lengths, query, ragged):
     torch.manual_seed(20261108)
     payload = envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD
-    if (query == 9 or ragged) and not payload:
-        pytest.skip("Q9/ragged decode requires the native VK recurrence payload")
+    if (query in (4, 9) or ragged) and not payload:
+        pytest.skip("Q4/Q9/ragged decode requires the native VK recurrence payload")
     slots = 2 * query + 8
     ordinary_page, prefill_page = 2 * query + 1, 2 * query + 2
-    spec_lengths = ((0, query) if ragged == "zero" else (1, 6) if ragged else (query, query)) if spec else ()
+    spec_lengths = (
+        ((0, query) if ragged == "zero" else (1, min(6, query - 1)) if ragged else (query, query)) if spec else ()
+    )
     spec_tokens, ndecode = sum(spec_lengths), int(ordinary)
     count = spec_tokens + ndecode + sum(lengths)
     values = dict(

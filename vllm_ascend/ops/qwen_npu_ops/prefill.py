@@ -99,7 +99,7 @@ class GdnPrefill:
         conv, ssm = layer.kv_cache[:2]
         steps = getattr(layer, "num_spec", None)
         if (
-            steps not in (7, 8)
+            steps not in (3, 7, 8)
             or tuple(conv.shape[1:]) != (3 + steps, 2560)
             or tuple(ssm.shape[1:]) != (12, 128, 128)
             or conv.dtype != torch.bfloat16

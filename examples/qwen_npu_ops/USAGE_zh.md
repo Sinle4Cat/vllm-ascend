@@ -2,6 +2,8 @@
 
 统一部署默认启用 R30 GDN Prefill、Native VK Decode 和 W8A8 decode QuantMatmul，RoPE 使用原生实现。
 可显式切换到 R22 GDN Decode + R01 RoPE 的 KV 路径。
+
+新增 MTP=3 对应 Q4，C8 的 decode Graph capture size 为 32，Conv history 为 6 行。Native VK manifest 必须明确声明 `supported_queries` 包含 Q4；旧 manifest 继续仅开放 Q1/Q8/Q9，不会被自动视为 Q4 payload。默认 KV 构建包含 Q4/Q8/Q9 的 B1–32 加 RoPE，共 97 个对象。本能力尚待目标环境的算子与模型验收，历史 K7/K8 结果不能作为 Q4 验收。R01 的 M1–72 范围不变，Q4/C8 的 M32 可命中，M128 仍走已有 native fallback；默认 VK 继续使用原生 RoPE。
 算子源码放在 [qwen_npu_ops](https://gitcode.com/sinle4cat/qwen_npu_ops)，框架接入放在
 [vllm-ascend 的 qwen-npu-ops-v0.30 分支](https://github.com/Sinle4Cat/vllm-ascend/tree/qwen-npu-ops-v0.30)。
 

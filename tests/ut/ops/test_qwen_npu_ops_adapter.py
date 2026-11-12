@@ -145,7 +145,7 @@ class QwenAdapterContracts(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "identity mismatch"):
                 self.prefill_env.configure_prefill_environment(identity)
 
-    def test_prefill_contracts_keep_k7_k8_and_real_boundaries(self):
+    def test_prefill_contracts_keep_k3_k7_k8_and_real_boundaries(self):
         layer = types.SimpleNamespace(
             num_spec=8,
             kv_cache=[Tensor((15, 11, 2560)), Tensor((15, 12, 128, 128), "fp32")],
@@ -165,7 +165,7 @@ class QwenAdapterContracts(unittest.TestCase):
         )
         values = [Tensor((129, 2560)), Tensor((129, 12, 128)), Tensor((129, 12)), Tensor((129, 12))]
         supports = self.prefill.GdnPrefill.supports
-        for steps in (7, 8):
+        for steps in (3, 7, 8):
             with (
                 patch.object(layer, "num_spec", steps),
                 patch.object(layer.kv_cache[0], "shape", (15, steps + 3, 2560)),
@@ -182,7 +182,7 @@ class QwenAdapterContracts(unittest.TestCase):
         prefix = "vllm_ascend.ops.qwen_npu_ops"
         load(prefix + ".state_bridge", ADAPTER / "state_bridge.py")
         chain_module = load(prefix + ".kv_chain", ADAPTER / "kv_chain.py")
-        for query in (8, 9):
+        for query in (4, 8, 9):
             for rows in (0, 3, 4 * query):
                 decode = Mock(return_value=Tensor((rows, 12, 128)))
                 chain = chain_module.KvGdnChain(decode, Mock())
@@ -225,7 +225,7 @@ class QwenAdapterContracts(unittest.TestCase):
         prefix = "vllm_ascend.ops.qwen_npu_ops"
         load(prefix + ".state_bridge", ADAPTER / "state_bridge.py")
         chain_module = load(prefix + ".kv_chain", ADAPTER / "kv_chain.py")
-        decode = Mock(buckets=tuple((batch, query) for batch in range(1, 33) for query in (8, 9)))
+        decode = Mock(buckets=tuple((batch, query) for batch in range(1, 33) for query in (4, 8, 9)))
         chain = chain_module.KvGdnChain(decode, Mock())
         conv, state = Tensor((1, 11, 2560)), Tensor((1, 12, 128, 128), "fp32")
         with patch.object(chain_module, "prepare"):
@@ -235,6 +235,60 @@ class QwenAdapterContracts(unittest.TestCase):
             self.assertEqual(decode.allocate_workspace.call_count, 8)
             with self.assertRaisesRegex(ValueError, "Missing R22"):
                 chain.prepare(conv, state, max_batch=33)
+
+    def test_kv_q4_prepares_six_row_history_before_capture(self):
+        prefix = "vllm_ascend.ops.qwen_npu_ops"
+        load(prefix + ".state_bridge", ADAPTER / "state_bridge.py")
+        module = load(prefix + ".kv_chain", ADAPTER / "kv_chain.py")
+        decode = Mock(buckets=tuple((batch, 4) for batch in range(1, 33)))
+        chain = module.KvGdnChain(decode, Mock())
+        with patch.object(module, "prepare") as prepare:
+            chain.prepare(Tensor((1, 6, 2560)), Tensor((1, 12, 128, 128), "fp32"), max_batch=32)
+        self.assertEqual(set(chain.bridges), {(batch, 4) for batch in range(1, 33)})
+        self.assertEqual(decode.allocate_workspace.call_count, 32)
+        self.assertEqual(prepare.call_args.args[2].shape, (32, 4))
+
+    def test_native_vk_manifest_declares_q4_without_relabeling_legacy(self):
+        module = load("qwen_native_vk_contract", ADAPTER / "native_recurrent.py")
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            library = root / "native.so"
+            library.write_bytes(b"CPU fixture; never loaded")
+            manifest = dict(
+                abi="qwen-native-vk-recurrent-v1",
+                status="COMPILED",
+                target=dict(machine="aarch64", torch="fixture", torch_npu="fixture"),
+                library=library.name,
+                library_sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
+            )
+
+            def construct(capability=None):
+                data = dict(manifest)
+                if capability is not None:
+                    data["supported_queries"] = capability
+                (root / "manifest.json").write_text(json.dumps(data))
+                return module.NativeVkRecurrent(root)
+
+            with (
+                patch.object(module, "version", return_value="fixture"),
+                patch.object(module.platform, "machine", return_value="aarch64"),
+                patch.object(module.ctypes, "CDLL") as loader,
+            ):
+                legacy = construct()
+                self.assertEqual(legacy.supported_queries, (1, 8, 9))
+                with self.assertRaisesRegex(ValueError, "does not declare"):
+                    legacy(
+                        Tensor((1, 4, 128)), Tensor((1, 4, 128)), Tensor((1, 12, 128)),
+                        Tensor((5, 12, 128, 128), "fp32"), beta=Tensor((1, 12)),
+                        actual_seq_lengths=Tensor((2,), "i32"), ssm_state_indices=Tensor((4,), "i32"),
+                    )
+                loader.return_value.call.assert_not_called()
+                self.assertEqual(construct([1, 4, 8, 9]).supported_queries, (1, 4, 8, 9))
+                for bad in ([], [1, 4, 4], [1, True], [1, 3], "1,4"):
+                    before = loader.call_count
+                    with self.assertRaisesRegex(ValueError, "capabilities"):
+                        construct(bad)
+                    self.assertEqual(loader.call_count, before)
 
     def test_rope_uses_r01_for_supported_inputs_and_native_for_others(self):
         rope = Mock()
@@ -261,11 +315,18 @@ class QwenAdapterContracts(unittest.TestCase):
         rope.supports.return_value = True
         self.assertIs(adapter.execute(*args), rope.return_value)
         self.assertEqual(adapter.snapshot()["capture_hits"], {"M72": 1})
+        args = Tensor((32, 3584)), *args[1:]
+        self.assertIs(adapter.execute(*args), rope.return_value)
+        self.assertEqual(adapter.snapshot()["capture_hits"], {"M72": 1, "M32": 1})
         rope.supports.return_value = False
         args = Tensor((73, 3584)), *args[1:]
         self.assertIs(adapter.execute(*args), native.return_value)
         self.assertEqual(native.call_args.args, args)
-        self.assertEqual(adapter.snapshot()["calls"], {"r01_M72": 1, "native_M73": 1})
+        self.assertEqual(adapter.snapshot()["calls"], {"r01_M72": 1, "r01_M32": 1, "native_M73": 1})
+        args = Tensor((128, 3584)), *args[1:]
+        self.assertIs(adapter.execute(*args), native.return_value)
+        self.assertEqual(native.call_args.args, args)
+        self.assertEqual(adapter.snapshot()["calls"]["native_M128"], 1)
 
     def test_vk_mixed_contract_preserves_source_metadata(self):
         module = load("vllm_ascend.ops.qwen_npu_ops.vk_chain", ADAPTER / "vk_chain.py")

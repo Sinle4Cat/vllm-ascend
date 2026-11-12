@@ -1,6 +1,6 @@
 # Experimental Qwen NPU Ops integration
 
-完整构建、配置和 K7/K8 启动步骤见 [Qwen NPU Ops 双仓使用指南](USAGE_zh.md)。
+完整构建、配置和 K3/K7/K8 启动步骤见 [Qwen NPU Ops 双仓使用指南](USAGE_zh.md)。
 
 This branch packages the R30 prefill, native VK decode, compact R22 decode with
 R01 RoPE, and W8A8 decode QuantMatmul adapters
@@ -22,6 +22,10 @@ credentials are embedded in this integration.
   Its Qwen model and DSpark checkpoint/graph compatibility changes remain
   prerequisites for reproducing that deployment; this adapter does not
   rewrite the upstream model or draft checkpoint.
+
+This branch adds MTP3/Q4 support to the current operator/framework candidate.
+It requires a new payload and independent qualification; the historical
+operator commit and validation above do not include Q4.
 
 The R30/R22 adapter bodies originate from the operator repository's
 `integrations/vllm_ascend`. This branch places them in framework namespaces,
@@ -91,6 +95,14 @@ buckets. Unbuilt buckets fail explicitly. Start with an empty cache;
 the worker rejects KV-transfer connectors because their layout contract is
 not qualified. Do not attach an old VK state snapshot to a KV worker.
 
+For K3, use `num_speculative_tokens:3` and capture size32 at concurrency8.
+The KV payload must include Q4 and uses six Conv history rows. Native VK stays
+the default; its new manifest must explicitly declare Q4 in supported_queries.
+Legacy manifests keep their original Q1/Q8/Q9 capabilities and reject Q4.
+Q4 is newly implemented and awaits target operator/model qualification; the
+historical K7/K8 scores do not qualify it. R01 RoPE remains M1..72: Q4/C8 M32
+is covered, while M128 uses the existing native fallback. VK keeps native RoPE.
+
 The worker changes allocation before cache initialization and keeps SSM
 state `[slot,head,K,V]` throughout. Pure or mixed prefill calls R30 per real
 sequence. Speculative, ragged and ordinary decode groups call R22 with
@@ -145,7 +157,7 @@ Run the state-bridge regression on an authorized, idle NPU:
 pytest -q tests/e2e/pull_request/one_card/ops/test_qwen_npu_ops_state_bridge.py
 ```
 
-The latter checks KV/VK orientation, K7/K8 page widths, padded bank strides,
+The latter checks KV/VK orientation, K3/K7/K8 page widths, padded bank strides,
 inactive/null pages, eager execution and captured Graph replay. It does not
 require model weights or a custom GDN payload. Operator accuracy and
 prefill/decode handoff validators remain in the operator repository.

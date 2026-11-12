@@ -10,7 +10,7 @@ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
 
 @pytest.mark.parametrize("layout", ["KV", "VK"])
-@pytest.mark.parametrize("query", [8, 9])
+@pytest.mark.parametrize("query", [4, 8, 9])
 @pytest.mark.parametrize("graph_mode", [False, True])
 def test_state_bridge_preserves_layout_stride_and_inactive_pages(layout, query, graph_mode):
     device = "npu:0"

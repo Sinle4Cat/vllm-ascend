@@ -70,11 +70,13 @@ class QwenPrefillWorker(NPUWorker):
         if getattr(self, "ssm_layout", "VK") == "VK" and envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD:
             self.recurrent = NativeVkRecurrent(envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD)
         for _, layer in sites:
-            assert layer.num_spec in (7, 8) and layer.tp_size == 4
+            assert layer.num_spec in (3, 7, 8) and layer.tp_size == 4
             if self.recurrent is not None:
+                if not {1, layer.num_spec + 1}.issubset(self.recurrent.supported_queries):
+                    raise ValueError("Native VK payload lacks the configured query/history capability")
                 layer.qwen_recurrent = self.recurrent
-            elif layer.num_spec == 8 and getattr(self, "ssm_layout", "VK") == "VK":
-                raise ValueError("VK K8 requires the native Q9 recurrence payload")
+            elif layer.num_spec in (3, 8) and getattr(self, "ssm_layout", "VK") == "VK":
+                raise ValueError("VK K3/K8 requires the native Q4/Q9 recurrence payload")
 
         def core(
             qkv: torch.Tensor, z: torch.Tensor, b: torch.Tensor, a: torch.Tensor, output: torch.Tensor, prefix: str
@@ -228,7 +230,7 @@ class QwenPrefillWorker(NPUWorker):
             scope="R30 pure/mixed/ragged prefill; native decode and RoPE retained",
         )
         if getattr(self, "ssm_layout", "VK") == "KV":
-            result["scope"] = "persistent KV: R30 Prefill, R22 K7/K8 Decode and R01 RoPE"
+            result["scope"] = "persistent KV: R30 Prefill, R22 K3/K7/K8 Decode and R01 RoPE"
             result["ssm_layout"] = "KV"
             result["kv_chain_calls"] = dict(self.kv_chain.calls) if hasattr(self, "kv_chain") else {}
             result["rope"] = self.rope.snapshot() if hasattr(self, "rope") else None

@@ -71,7 +71,7 @@ def launch(recurrence, inputs, state, lens, ids, accepted):
     )
 
 
-@pytest.mark.parametrize("width", [8, 9])
+@pytest.mark.parametrize("width", [4, 8, 9])
 @pytest.mark.parametrize(
     "kind", ["full", "ragged", "zero-middle", "zero-first", "batch8-short", "batch8", "batch8-ragged"]
 )
@@ -79,7 +79,7 @@ def test_native_vk_full_state(recurrence, width, kind):
     torch.manual_seed(20261108)
     lengths = {
         "full": [width, width],
-        "ragged": [1, 6],
+        "ragged": [1, min(6, width - 1)],
         "zero-middle": [width, 1, 0, 3],
         "zero-first": [0, 1, width, 0],
         "batch8-short": [2] * 8,
@@ -89,7 +89,7 @@ def test_native_vk_full_state(recurrence, width, kind):
     _check_case(recurrence, width, lengths, parity=width == 8 and kind in ("full", "batch8"))
 
 
-@pytest.mark.parametrize("width,lengths,graph", [(1, [1, 0, 1], False), (9, [1, 6], True)])
+@pytest.mark.parametrize("width,lengths,graph", [(1, [1, 0, 1], False), (4, [1, 3], True), (9, [1, 6], True)])
 def test_native_vk_ordinary_and_graph(recurrence, width, lengths, graph):
     torch.manual_seed(20261108)
     _check_case(recurrence, width, lengths, graph=graph)
@@ -150,7 +150,7 @@ def _check_case(recurrence, width, lengths, *, graph=False, parity=False):
         torch.testing.assert_close(state.cpu(), actual_state, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("width", [8, 9])
+@pytest.mark.parametrize("width", [4, 8, 9])
 @pytest.mark.parametrize("case", ["ragged", "reversed", "all-zero"])
 def test_native_vk_graph_metadata_changes(recurrence, width, case):
     torch.manual_seed(20261109)
@@ -170,7 +170,7 @@ def test_native_vk_graph_metadata_changes(recurrence, width, case):
     with torch.npu.graph(captured):
         output = launch(recurrence, device_inputs, state, lens, ids, accepted)
     lengths, counts = {
-        "ragged": ([1, 6, 0], [width, 2, 0]),
+        "ragged": ([1, min(6, width - 1), 0], [width, 2, 0]),
         "reversed": ([0, width, 1], [0, width, 1]),
         "all-zero": ([0, 0, 0], [0, 0, 0]),
     }[case]
