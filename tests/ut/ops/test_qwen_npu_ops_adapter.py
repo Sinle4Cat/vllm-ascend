@@ -248,6 +248,47 @@ class QwenAdapterContracts(unittest.TestCase):
         self.assertEqual(decode.allocate_workspace.call_count, 32)
         self.assertEqual(prepare.call_args.args[2].shape, (32, 4))
 
+    def test_bank_workspace_cache_does_not_skip_real_bank_binding(self):
+        prefix = "vllm_ascend.ops.qwen_npu_ops"
+        load(prefix + ".state_bridge", ADAPTER / "state_bridge.py")
+        module = load(prefix + ".bank_chain", ADAPTER / "bank_chain.py")
+        decode = Mock(buckets=tuple((batch, 8) for batch in range(1, 9)))
+        chain = module.BankKvGdnChain(decode, Mock())
+        dummy = Tensor((1, 10, 2560)), Tensor((1, 12, 128, 128), "fp32")
+        real = Tensor((724, 10, 2560)), Tensor((724, 12, 128, 128), "fp32")
+        chain.prepare(*dummy, max_batch=8)
+        chain.prepare(*real, max_batch=8)
+        self.assertEqual(decode.prepare_bank.call_count, 2)
+        self.assertIs(decode.prepare_bank.call_args.args[0], real[0])
+        self.assertEqual(decode.allocate_workspace.call_count, 8)
+        self.assertFalse(chain.bridges)
+
+    def test_bank_decode_passes_global_ids_true_boundaries_and_accepted(self):
+        prefix = "vllm_ascend.ops.qwen_npu_ops"
+        bridge = load(prefix + ".state_bridge", ADAPTER / "state_bridge.py")
+        module = load(prefix + ".bank_chain", ADAPTER / "bank_chain.py")
+        for query in (8, 9):
+            decode = Mock(return_value=Tensor((3, 12, 128)))
+            chain = module.BankKvGdnChain(decode, Mock())
+            chain.workspaces[4, query] = object()
+            conv, ssm = Tensor((724, query+2, 2560)), Tensor((724, 12, 128, 128), "fp32")
+            layer = types.SimpleNamespace(num_spec=query-1, kv_cache=[conv, ssm], A_log=Tensor((12,)),
+                                          dt_bias=Tensor((12,)), norm=types.SimpleNamespace(weight=Tensor((128,))))
+            starts, indices, accepted = Tensor((5,)), Tensor((4, query)), Tensor((4,))
+            with patch.object(bridge, "gather") as gather, patch.object(bridge, "scatter") as scatter:
+                chain.decode_group(layer, Tensor((3, 2560)), Tensor((3, 12, 128)),
+                                   Tensor((3, 12)), Tensor((3, 12)), starts, indices, accepted)
+                gather.assert_not_called()
+                scatter.assert_not_called()
+            args = decode.call_args.args
+            self.assertIs(args[5], conv)
+            self.assertIs(args[8], ssm)
+            self.assertIs(args[9], indices)
+            self.assertIs(args[10], starts)
+            self.assertIs(args[11], accepted)
+            self.assertIs(args[13], decode.metadata_for_bank.return_value)
+            self.assertEqual(chain.calls["r22_bank_groups"], 1)
+
     def test_native_vk_manifest_declares_q4_without_relabeling_legacy(self):
         module = load("qwen_native_vk_contract", ADAPTER / "native_recurrent.py")
         with tempfile.TemporaryDirectory() as folder:

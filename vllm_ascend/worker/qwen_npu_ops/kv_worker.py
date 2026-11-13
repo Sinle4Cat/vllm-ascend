@@ -4,7 +4,9 @@ Use a fresh empty cache. VK snapshots and cross-layout KV connectors are not
 compatible with this worker; the allocation and every GDN consumer use KV.
 """
 
+import json
 import types
+from pathlib import Path
 
 import torch
 from qwen_npu_ops import GdnDecode
@@ -25,8 +27,19 @@ class QwenKvWorker(QwenPrefillWorker):
         from vllm_ascend.ops.qwen_npu_ops.rope import QwenRopeAdapter
 
         payload = envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD
-        self.kv_chain = KvGdnChain(GdnDecode(payload, allow_experimental=True), self.prefill)
-        self.rope = QwenRopeAdapter(payload, self.model_runner.get_model())
+        abi = json.loads((Path(payload) / "manifest.json").read_text())["abi"]
+        if abi == "qwen-decode-bank-v1":
+            from qwen_npu_ops.gdn_bank import BankGdnDecode
+
+            from vllm_ascend.ops.qwen_npu_ops.bank_chain import BankKvGdnChain
+
+            decode = BankGdnDecode(payload, allow_experimental=True)
+            self.kv_chain = BankKvGdnChain(decode, self.prefill)
+            rope_payload = str(decode.rope_payload)
+        else:
+            self.kv_chain = KvGdnChain(GdnDecode(payload, allow_experimental=True), self.prefill)
+            rope_payload = payload
+        self.rope = QwenRopeAdapter(rope_payload, self.model_runner.get_model())
         for layer in self.prefill_sites.values():
             vk_shapes = layer.get_state_shape
 
