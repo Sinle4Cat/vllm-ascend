@@ -414,6 +414,41 @@ class QwenAdapterContracts(unittest.TestCase):
         ):
             module.QwenKvWorker().load_model()
 
+    def test_kv_worker_selects_explicit_legacy_bank_or_split_abi(self):
+        parent = types.SimpleNamespace(QwenPrefillWorker=type("Parent", (), {"load_model": lambda _: None}))
+        sys.modules["vllm_ascend.worker.qwen_npu_ops.prefill_worker"] = parent
+        prefix = "vllm_ascend.ops.qwen_npu_ops"
+        bank_chain = Mock()
+        legacy_chain = Mock()
+        sys.modules[prefix + ".kv_chain"] = types.SimpleNamespace(KvGdnChain=legacy_chain)
+        sys.modules[prefix + ".bank_chain"] = types.SimpleNamespace(BankKvGdnChain=bank_chain)
+        sys.modules[prefix + ".rope"] = types.SimpleNamespace(QwenRopeAdapter=Mock())
+        regular, bank, split = Mock(), Mock(), Mock()
+        bank.return_value.rope_payload = split.return_value.rope_payload = "child"
+        sys.modules["qwen_npu_ops"].GdnDecode = regular
+        sys.modules["qwen_npu_ops.gdn_bank"] = types.SimpleNamespace(BankGdnDecode=bank)
+        sys.modules["qwen_npu_ops.gdn_bank_split"] = types.SimpleNamespace(SplitBankGdnDecode=split)
+        module = load("qwen_kv_worker_abi_contract", WORKER / "kv_worker.py")
+        with tempfile.TemporaryDirectory() as folder:
+            for abi, expected in (("qwen-decode-direct-v1", regular), ("qwen-decode-bank-v1", bank),
+                                  ("qwen-decode-bank-split-v1", split)):
+                (Path(folder) / "manifest.json").write_text(json.dumps(dict(abi=abi)))
+                for constructor in (regular, bank, split):
+                    constructor.reset_mock()
+                worker = module.QwenKvWorker()
+                worker.vllm_config = types.SimpleNamespace(kv_transfer_config=None,
+                    scheduler_config=types.SimpleNamespace(max_num_seqs=8))
+                worker.prefill, worker.model_runner = Mock(), Mock()
+                worker.prefill_sites = {"layer": types.SimpleNamespace(num_spec=7, A_log=Tensor((12,)),
+                    get_state_shape=lambda: ((10, 2560), (12, 128, 128)))}
+                with patch.dict(os.environ, {"VLLM_ASCEND_QWEN_PREFILL_ENABLE": "1",
+                                            "VLLM_ASCEND_QWEN_DECODE_PAYLOAD": folder}):
+                    worker.load_model()
+                expected.assert_called_once_with(folder, allow_experimental=True)
+                for constructor in (regular, bank, split):
+                    if constructor is not expected:
+                        constructor.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

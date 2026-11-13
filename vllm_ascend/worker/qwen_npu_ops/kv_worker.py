@@ -28,12 +28,15 @@ class QwenKvWorker(QwenPrefillWorker):
 
         payload = envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD
         abi = json.loads((Path(payload) / "manifest.json").read_text())["abi"]
-        if abi == "qwen-decode-bank-v1":
-            from qwen_npu_ops.gdn_bank import BankGdnDecode
+        if abi in ("qwen-decode-bank-v1", "qwen-decode-bank-split-v1"):
+            if abi == "qwen-decode-bank-split-v1":
+                from qwen_npu_ops.gdn_bank_split import SplitBankGdnDecode as Decode
+            else:
+                from qwen_npu_ops.gdn_bank import BankGdnDecode as Decode
 
             from vllm_ascend.ops.qwen_npu_ops.bank_chain import BankKvGdnChain
 
-            decode = BankGdnDecode(payload, allow_experimental=True)
+            decode = Decode(payload, allow_experimental=True)
             self.kv_chain = BankKvGdnChain(decode, self.prefill)
             rope_payload = str(decode.rope_payload)
         else:
