@@ -4,6 +4,7 @@ Use a fresh empty cache. VK snapshots and cross-layout KV connectors are not
 compatible with this worker; the allocation and every GDN consumer use KV.
 """
 
+import hashlib
 import json
 import os
 import types
@@ -17,7 +18,35 @@ from vllm_ascend.ops.qwen_npu_ops.kv_chain import KvGdnChain
 from vllm_ascend.worker.qwen_npu_ops.prefill_worker import QwenPrefillWorker
 
 
+def _configure_registered_opp():
+    """Keep the selected, already-active ADN prefix ahead of backend autoloads."""
+    selected = os.environ.get("QWEN_GDN_DECODE_REGISTERED_IDENTITY")
+    expected = os.environ.get("QWEN_GDN_DECODE_REGISTERED_IDENTITY_SHA")
+    if not selected and not expected:
+        return
+    if not selected or not expected:
+        raise ValueError("ADN requires an identity and SHA before device initialization")
+    data = Path(selected).read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError("ADN runtime identity SHA mismatch")
+    identity = json.loads(data)
+    if identity.get("schema") != "gdn-decode-registered-runtime-identity/2":
+        raise ValueError("ADN requires the split-input registered ABI")
+    vendor = Path(identity["vendor_dir"]).resolve()
+    prefixes = [Path(item).resolve() for item in os.environ.get("ASCEND_CUSTOM_OPP_PATH", "").split(os.pathsep) if item]
+    if not vendor.is_dir() or vendor not in prefixes:
+        raise ValueError("Activate the ADN vendor before device initialization; late registration is unsupported")
+    os.environ["ASCEND_CUSTOM_OPP_PATH"] = os.pathsep.join(
+        dict.fromkeys([str(vendor), *(str(item) for item in prefixes if item != vendor)])
+    )
+
+
 class QwenKvWorker(QwenPrefillWorker):
+    def init_device(self):
+        _configure_registered_opp()
+        super().init_device()
+        _configure_registered_opp()
+
     def load_model(self):
         if not envs.VLLM_ASCEND_QWEN_PREFILL_ENABLE or not envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD:
             raise ValueError("The KV worker requires enabled R30 prefill and an explicit compact R22 payload")
@@ -25,6 +54,7 @@ class QwenKvWorker(QwenPrefillWorker):
         if self.vllm_config.kv_transfer_config is not None:
             raise ValueError("Persistent KV requires a layout-aware connector; none is qualified here")
         super().load_model()
+        _configure_registered_opp()
         from vllm_ascend.ops.qwen_npu_ops.rope import QwenRopeAdapter
 
         payload = envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD
