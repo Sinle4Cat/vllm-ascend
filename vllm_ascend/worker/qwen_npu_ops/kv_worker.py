@@ -5,6 +5,7 @@ compatible with this worker; the allocation and every GDN consumer use KV.
 """
 
 import json
+import os
 import types
 from pathlib import Path
 
@@ -27,8 +28,21 @@ class QwenKvWorker(QwenPrefillWorker):
         from vllm_ascend.ops.qwen_npu_ops.rope import QwenRopeAdapter
 
         payload = envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD
-        abi = json.loads((Path(payload) / "manifest.json").read_text())["abi"]
-        if abi in ("qwen-decode-bank-v1", "qwen-decode-bank-split-v1"):
+        registered_identity = os.environ.get("QWEN_GDN_DECODE_REGISTERED_IDENTITY")
+        registered_sha = os.environ.get("QWEN_GDN_DECODE_REGISTERED_IDENTITY_SHA")
+        if registered_identity or registered_sha:
+            if not registered_identity or not registered_sha:
+                raise ValueError("ADN requires an explicit identity and SHA; no direct Decode fallback")
+            from qwen_npu_ops import RegisteredGdnDecode
+            from vllm_ascend.ops.qwen_npu_ops.bank_chain import BankKvGdnChain
+
+            decode = RegisteredGdnDecode(registered_identity, identity_sha256=registered_sha, allow_experimental=True)
+            self.kv_chain = BankKvGdnChain(decode, self.prefill)
+            # The separate payload supplies RoPE only. No direct GDN .so is loaded.
+            rope_payload = payload
+        elif (abi := json.loads((Path(payload) / "manifest.json").read_text())["abi"]) in (
+            "qwen-decode-bank-v1", "qwen-decode-bank-split-v1"
+        ):
             if abi == "qwen-decode-bank-split-v1":
                 from qwen_npu_ops.gdn_bank_split import SplitBankGdnDecode as Decode
             else:

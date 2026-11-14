@@ -234,6 +234,12 @@ class QwenPrefillWorker(NPUWorker):
             result["ssm_layout"] = "KV"
             result["kv_chain_calls"] = dict(self.kv_chain.calls) if hasattr(self, "kv_chain") else {}
             result["rope"] = self.rope.snapshot() if hasattr(self, "rope") else None
+            decode = getattr(getattr(self, "kv_chain", None), "decode", None)
+            if decode is not None and hasattr(decode, "registered_status"):
+                result["scope"] = "persistent KV: registered ADN Decode, R30 Prefill and R01 RoPE"
+                result["registered_decode"] = dict(
+                    api=type(decode).__module__ + "." + type(decode).__name__,
+                    identity=str(decode.identity_path), status=decode.registered_status())
         folder = Path(envs.VLLM_ASCEND_QWEN_OPS_RUN_DIR)
         folder.mkdir(parents=True, exist_ok=True)
         with (folder / f"prefill-route-{label}-rank{self.rank}.json").open("x") as stream:

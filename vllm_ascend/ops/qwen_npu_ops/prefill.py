@@ -63,10 +63,11 @@ class GdnPrefill:
         spec = importlib.util.spec_from_file_location(self.extension_path.stem, self.extension_path)
         self.extension = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.extension)
-        from fla_npu.ops.ascendc import _runtime
-
         opapi = self.vendor / "op_api/lib/libcust_opapi.so"
-        libraries = [str(opapi), *[lib._name for lib in _runtime.runtime()._libraries[1:]]]
+        cann = Path(os.environ["ASCEND_HOME_PATH"])
+        libraries = [str(opapi), str(cann / "lib64/libnnopbase.so"), str(cann / "lib64/libruntime.so")]
+        if not all(Path(path).is_file() for path in libraries):
+            raise RuntimeError("Prefill requires explicit CANN runtime providers")
         self.extension.initialize(libraries, str(opapi))
         self._buffers = {}
 
