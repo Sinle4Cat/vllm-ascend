@@ -271,13 +271,26 @@ class QwenAdapterContracts(unittest.TestCase):
             decode = Mock(return_value=Tensor((3, 12, 128)))
             chain = module.BankKvGdnChain(decode, Mock())
             chain.workspaces[4, query] = object()
-            conv, ssm = Tensor((724, query+2, 2560)), Tensor((724, 12, 128, 128), "fp32")
-            layer = types.SimpleNamespace(num_spec=query-1, kv_cache=[conv, ssm], A_log=Tensor((12,)),
-                                          dt_bias=Tensor((12,)), norm=types.SimpleNamespace(weight=Tensor((128,))))
+            conv, ssm = Tensor((724, query + 2, 2560)), Tensor((724, 12, 128, 128), "fp32")
+            layer = types.SimpleNamespace(
+                num_spec=query - 1,
+                kv_cache=[conv, ssm],
+                A_log=Tensor((12,)),
+                dt_bias=Tensor((12,)),
+                norm=types.SimpleNamespace(weight=Tensor((128,))),
+            )
             starts, indices, accepted = Tensor((5,)), Tensor((4, query)), Tensor((4,))
             with patch.object(bridge, "gather") as gather, patch.object(bridge, "scatter") as scatter:
-                chain.decode_group(layer, Tensor((3, 2560)), Tensor((3, 12, 128)),
-                                   Tensor((3, 12)), Tensor((3, 12)), starts, indices, accepted)
+                chain.decode_group(
+                    layer,
+                    Tensor((3, 2560)),
+                    Tensor((3, 12, 128)),
+                    Tensor((3, 12)),
+                    Tensor((3, 12)),
+                    starts,
+                    indices,
+                    accepted,
+                )
                 gather.assert_not_called()
                 scatter.assert_not_called()
             args = decode.call_args.args
@@ -319,9 +332,13 @@ class QwenAdapterContracts(unittest.TestCase):
                 self.assertEqual(legacy.supported_queries, (1, 8, 9))
                 with self.assertRaisesRegex(ValueError, "does not declare"):
                     legacy(
-                        Tensor((1, 4, 128)), Tensor((1, 4, 128)), Tensor((1, 12, 128)),
-                        Tensor((5, 12, 128, 128), "fp32"), beta=Tensor((1, 12)),
-                        actual_seq_lengths=Tensor((2,), "i32"), ssm_state_indices=Tensor((4,), "i32"),
+                        Tensor((1, 4, 128)),
+                        Tensor((1, 4, 128)),
+                        Tensor((1, 12, 128)),
+                        Tensor((5, 12, 128, 128), "fp32"),
+                        beta=Tensor((1, 12)),
+                        actual_seq_lengths=Tensor((2,), "i32"),
+                        ssm_state_indices=Tensor((4,), "i32"),
                     )
                 loader.return_value.call.assert_not_called()
                 self.assertEqual(construct([1, 4, 8, 9]).supported_queries, (1, 4, 8, 9))
@@ -410,7 +427,7 @@ class QwenAdapterContracts(unittest.TestCase):
         module = load("qwen_kv_worker_contract", WORKER / "kv_worker.py")
         with (
             patch.dict(os.environ, {"VLLM_ASCEND_QWEN_PREFILL_ENABLE": "0"}),
-            self.assertRaisesRegex(ValueError, "requires enabled R30"),
+            self.assertRaisesRegex(ValueError, "requires enabled Prefill"),
         ):
             module.QwenKvWorker().load_model()
 
@@ -430,19 +447,27 @@ class QwenAdapterContracts(unittest.TestCase):
         sys.modules["qwen_npu_ops.gdn_bank_split"] = types.SimpleNamespace(SplitBankGdnDecode=split)
         module = load("qwen_kv_worker_abi_contract", WORKER / "kv_worker.py")
         with tempfile.TemporaryDirectory() as folder:
-            for abi, expected in (("qwen-decode-direct-v1", regular), ("qwen-decode-bank-v1", bank),
-                                  ("qwen-decode-bank-split-v1", split)):
+            for abi, expected in (
+                ("qwen-decode-direct-v1", regular),
+                ("qwen-decode-bank-v1", bank),
+                ("qwen-decode-bank-split-v1", split),
+            ):
                 (Path(folder) / "manifest.json").write_text(json.dumps(dict(abi=abi)))
                 for constructor in (regular, bank, split):
                     constructor.reset_mock()
                 worker = module.QwenKvWorker()
-                worker.vllm_config = types.SimpleNamespace(kv_transfer_config=None,
-                    scheduler_config=types.SimpleNamespace(max_num_seqs=8))
+                worker.vllm_config = types.SimpleNamespace(
+                    kv_transfer_config=None, scheduler_config=types.SimpleNamespace(max_num_seqs=8)
+                )
                 worker.prefill, worker.model_runner = Mock(), Mock()
-                worker.prefill_sites = {"layer": types.SimpleNamespace(num_spec=7, A_log=Tensor((12,)),
-                    get_state_shape=lambda: ((10, 2560), (12, 128, 128)))}
-                with patch.dict(os.environ, {"VLLM_ASCEND_QWEN_PREFILL_ENABLE": "1",
-                                            "VLLM_ASCEND_QWEN_DECODE_PAYLOAD": folder}):
+                worker.prefill_sites = {
+                    "layer": types.SimpleNamespace(
+                        num_spec=7, A_log=Tensor((12,)), get_state_shape=lambda: ((10, 2560), (12, 128, 128))
+                    )
+                }
+                with patch.dict(
+                    os.environ, {"VLLM_ASCEND_QWEN_PREFILL_ENABLE": "1", "VLLM_ASCEND_QWEN_DECODE_PAYLOAD": folder}
+                ):
                     worker.load_model()
                 expected.assert_called_once_with(folder, allow_experimental=True)
                 for constructor in (regular, bank, split):

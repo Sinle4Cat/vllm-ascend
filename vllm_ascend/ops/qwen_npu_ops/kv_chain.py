@@ -1,4 +1,4 @@
-"""Persistent KV dispatch: mixed/ragged Prefill uses R30, Decode uses R22."""
+"""Persistent KV dispatch with batched stage Prefill and explicit Decode."""
 
 from collections import Counter
 
@@ -116,6 +116,16 @@ class KvGdnChain:
             non_out[:ndecode].copy_(result)
             self.calls["r22_single_groups"] += 1
         if meta.num_prefills:
+            if hasattr(self.prefill, "run_group"):
+                self.prefill.run_group(layer, meta, *[x[ndecode:] for x in values], non_out[ndecode:])
+                self.calls["three_stage_prefill_groups"] += 1
+                self.calls["three_stage_prefill_sequences"] += int(meta.num_prefills)
+                if mixed:
+                    output.index_copy_(0, token_ids, non_out)
+                    self.calls["mixed_batches"] += 1
+                else:
+                    output[:count].copy_(non_out)
+                return
             chunk = meta.non_spec_prefill_metadata.chunk
             ends = None if chunk is None else getattr(chunk, "cu_seqlens_host", None)
             if ends is None or len(ends) != meta.num_prefills + 1:

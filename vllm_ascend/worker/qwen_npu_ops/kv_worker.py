@@ -49,7 +49,7 @@ class QwenKvWorker(QwenPrefillWorker):
 
     def load_model(self):
         if not envs.VLLM_ASCEND_QWEN_PREFILL_ENABLE or not envs.VLLM_ASCEND_QWEN_DECODE_PAYLOAD:
-            raise ValueError("The KV worker requires enabled R30 prefill and an explicit compact R22 payload")
+            raise ValueError("The KV worker requires enabled Prefill and an explicit RoPE/Decode payload")
         self.ssm_layout = "KV"
         if self.vllm_config.kv_transfer_config is not None:
             raise ValueError("Persistent KV requires a layout-aware connector; none is qualified here")
@@ -64,6 +64,7 @@ class QwenKvWorker(QwenPrefillWorker):
             if not registered_identity or not registered_sha:
                 raise ValueError("ADN requires an explicit identity and SHA; no direct Decode fallback")
             from qwen_npu_ops import RegisteredGdnDecode
+
             from vllm_ascend.ops.qwen_npu_ops.bank_chain import BankKvGdnChain
 
             decode = RegisteredGdnDecode(registered_identity, identity_sha256=registered_sha, allow_experimental=True)
@@ -71,7 +72,8 @@ class QwenKvWorker(QwenPrefillWorker):
             # The separate payload supplies RoPE only. No direct GDN .so is loaded.
             rope_payload = payload
         elif (abi := json.loads((Path(payload) / "manifest.json").read_text())["abi"]) in (
-            "qwen-decode-bank-v1", "qwen-decode-bank-split-v1"
+            "qwen-decode-bank-v1",
+            "qwen-decode-bank-split-v1",
         ):
             if abi == "qwen-decode-bank-split-v1":
                 from qwen_npu_ops.gdn_bank_split import SplitBankGdnDecode as Decode

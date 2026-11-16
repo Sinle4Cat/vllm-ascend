@@ -42,6 +42,7 @@ DepthWiseSeperableConv1d = "DepthWiseSeperableConv1d"
 depthwise_seperable_CNN = "depthwise_seperable_CNN"
 
 [default.extend-words]
+adn = "adn"
 mata = "mata"
 iy = "iy"
 tendencias = "tendencias"

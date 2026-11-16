@@ -1,7 +1,7 @@
-"""R30-only validation worker; retain the installed decode and RoPE implementations.
+"""Explicit Qwen Prefill worker with identity-selected three-stage/R30 providers.
 
-Use the same wrapper with VLLM_ASCEND_QWEN_PREFILL_ENABLE=0 for the before arm. All route
-counters execute in the custom-op body, outside Dynamo-traced forward methods.
+Route counters execute in the custom-op body, outside traced forward methods.
+The KV subclass selects registered ADN Decode and the separate R01 RoPE payload.
 """
 
 import json
@@ -23,15 +23,19 @@ from vllm_ascend.worker.worker import NPUWorker
 
 
 class QwenPrefillWorker(NPUWorker):
+    def init_device(self):
+        super().init_device()
+        torch.npu.matmul.allow_hf32 = False
+        torch.npu.conv.allow_hf32 = False
+
     def load_model(self):
         if not all(
             (
                 envs.VLLM_ASCEND_QWEN_PREFILL_IDENTITY,
-                envs.VLLM_ASCEND_QWEN_PREFILL_BRIDGE,
                 envs.VLLM_ASCEND_QWEN_OPS_RUN_DIR,
             )
         ):
-            raise ValueError("Qwen workers require explicit prefill identity, bridge and run-directory paths")
+            raise ValueError("Qwen workers require explicit prefill identity and run-directory paths")
         self.quant_matmul = None
         payload = envs.VLLM_ASCEND_QWEN_QUANT_MATMUL_PAYLOAD
         if payload:
@@ -46,11 +50,21 @@ class QwenPrefillWorker(NPUWorker):
 
         assert self.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
         assert get_pcp_group().world_size == 1
-        self.prefill = GdnPrefill(
-            envs.VLLM_ASCEND_QWEN_PREFILL_IDENTITY,
-            envs.VLLM_ASCEND_QWEN_PREFILL_BRIDGE,
-            ssm_layout=getattr(self, "ssm_layout", "VK"),
-        )
+        identity = envs.VLLM_ASCEND_QWEN_PREFILL_IDENTITY
+        schema = json.loads(Path(identity).read_text()).get("schema")
+        if schema == "qwen-chunk-gdn-runtime-identity/1":
+            from vllm_ascend.ops.qwen_npu_ops.staged_prefill import ThreeStagePrefill
+
+            self.prefill = ThreeStagePrefill(identity, ssm_layout=getattr(self, "ssm_layout", "VK"))
+        else:
+            if not envs.VLLM_ASCEND_QWEN_PREFILL_BRIDGE:
+                raise ValueError("R30 requires its matching Prefill bridge")
+            self.prefill = GdnPrefill(
+                identity,
+                envs.VLLM_ASCEND_QWEN_PREFILL_BRIDGE,
+                ssm_layout=getattr(self, "ssm_layout", "VK"),
+            )
+        self.prefill_backend = getattr(self.prefill, "backend", "r30")
         self.prefill.prepare(torch.device("npu", torch.npu.current_device()))
         self.vk_chain = VkGdnChain(self.prefill)
         self.prefill_enabled = envs.VLLM_ASCEND_QWEN_PREFILL_ENABLE
@@ -96,13 +110,13 @@ class QwenPrefillWorker(NPUWorker):
                 gdn_module.record_attention_compute_start()
                 if mixed_supported:
                     count = self.vk_chain(layer, meta, qkv, z, b, a, output)
-                    self.prefill_calls["r30_mixed_batches"] += 1
+                    self.prefill_calls[f"{self.prefill_backend}_mixed_batches"] += 1
                     self.prefill_calls["native_mixed_spec_groups"] += int(meta.spec_sequence_masks is not None)
                     self.prefill_calls["native_mixed_decode_groups"] += int(meta.num_decodes > 0)
                 else:
                     count = self.prefill(layer, meta, qkv, z, b, a, output, gdn_module._get_packed_conv_weights(layer))
-                self.prefill_calls["r30_sequences"] += count
-                self.prefill_calls["r30_batches"] += 1
+                self.prefill_calls[f"{self.prefill_backend}_sequences"] += count
+                self.prefill_calls[f"{self.prefill_backend}_batches"] += 1
                 self.prefill_layers.add(prefix)
                 self.prefill_shapes[int(meta.num_actual_tokens)] += 1
                 gdn_module.maybe_save_kv_layer_to_connector("", [])
@@ -130,7 +144,7 @@ class QwenPrefillWorker(NPUWorker):
         # Keep dispatch outside traced forwards so Graph capture sees tensor
         # operations while route counters remain in the custom-op body.
         direct_register_custom_op(
-            "qwen_r30_prefill_validation",
+            "qwen_gdn_prefill_core",
             core,
             mutates_args=["output"],
             fake_impl=fake_core,
@@ -166,7 +180,7 @@ class QwenPrefillWorker(NPUWorker):
                         layer.head_v_dim,
                     )
                 value = torch.zeros_like(z)
-                torch.ops.vllm.qwen_r30_prefill_validation(qkv, z, b.contiguous(), a.contiguous(), value, layer.prefix)
+                torch.ops.vllm.qwen_gdn_prefill_core(qkv, z, b.contiguous(), a.contiguous(), value, layer.prefix)
                 result, _ = layer.out_proj(value.reshape(value.shape[0], -1))
                 if output is not None:
                     output[: hidden_states.shape[0]] = result
@@ -227,19 +241,23 @@ class QwenPrefillWorker(NPUWorker):
             quant_matmul=None if self.quant_matmul is None else self.quant_matmul.snapshot(),
             native_recurrent=None if self.recurrent is None else self.recurrent.identity,
             layout=self.prefill_layout,
-            scope="R30 pure/mixed/ragged prefill; native decode and RoPE retained",
+            scope=f"{self.prefill_backend} pure/mixed/ragged prefill; explicit decode route",
         )
         if getattr(self, "ssm_layout", "VK") == "KV":
-            result["scope"] = "persistent KV: R30 Prefill, R22 K3/K7/K8 Decode and R01 RoPE"
+            result["scope"] = f"persistent KV: {self.prefill_backend} Prefill, explicit Decode and R01 RoPE"
             result["ssm_layout"] = "KV"
             result["kv_chain_calls"] = dict(self.kv_chain.calls) if hasattr(self, "kv_chain") else {}
             result["rope"] = self.rope.snapshot() if hasattr(self, "rope") else None
             decode = getattr(getattr(self, "kv_chain", None), "decode", None)
             if decode is not None and hasattr(decode, "registered_status"):
-                result["scope"] = "persistent KV: registered ADN Decode, R30 Prefill and R01 RoPE"
+                result["scope"] = f"persistent KV: registered ADN Decode, {self.prefill_backend} Prefill and R01 RoPE"
                 result["registered_decode"] = dict(
                     api=type(decode).__module__ + "." + type(decode).__name__,
-                    identity=str(decode.identity_path), status=decode.registered_status())
+                    identity=str(decode.identity_path),
+                    status=decode.registered_status(),
+                )
+        result["prefill_backend"] = self.prefill_backend
+        result["hf32"] = dict(matmul=torch.npu.matmul.allow_hf32, conv=torch.npu.conv.allow_hf32)
         folder = Path(envs.VLLM_ASCEND_QWEN_OPS_RUN_DIR)
         folder.mkdir(parents=True, exist_ok=True)
         with (folder / f"prefill-route-{label}-rank{self.rank}.json").open("x") as stream:
